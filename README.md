@@ -86,7 +86,7 @@ GET /api/v1/chart?team_ids=<team_a>,<team_b>
 
 ## Mail Notifications
 
-When mail is enabled, updates are sent through SMTP to all configured recipients in one message.
+When mail is enabled, the service sends one initial snapshot email after first persistence, and sends update emails for later leaderboard changes. All configured recipients receive the same message.
 
 CLI overrides:
 

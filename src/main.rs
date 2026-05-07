@@ -85,24 +85,74 @@ fn run_fetch_cycle(
     let is_initial_snapshot = previous.is_empty();
     let fetched_at = insert_snapshot(conn, page.source_updated_at.as_deref(), &page.rows, &diff)
         .context("failed to persist leaderboard snapshot")?;
-
-    if !is_initial_snapshot {
-        let body = format_mail_body(&fetched_at, &diff.events);
-        let subject = format!("Leaderboard updated ({} changes)", diff.events.len());
-        notifier.notify_update(&subject, &body)?;
+    let (subject, body) = build_notification_message(
+        is_initial_snapshot,
+        &fetched_at,
+        page.rows.len(),
+        &diff.events,
+    );
+    notifier.notify_update(&subject, &body)?;
+    if is_initial_snapshot {
+        info!(
+            teams = page.rows.len(),
+            "initial leaderboard snapshot created"
+        );
+    } else {
         info!(changes = diff.events.len(), "leaderboard updated");
     }
 
     Ok(true)
 }
 
-fn format_mail_body(fetched_at: &str, events: &[crate::diff::TeamEvent]) -> String {
+fn build_notification_message(
+    is_initial_snapshot: bool,
+    fetched_at: &str,
+    team_count: usize,
+    events: &[crate::diff::TeamEvent],
+) -> (String, String) {
+    if is_initial_snapshot {
+        return (
+            format!(
+                "Initial leaderboard snapshot created ({} teams)",
+                team_count
+            ),
+            format_initial_mail_body(fetched_at, team_count, events),
+        );
+    }
+
+    (
+        format!("Leaderboard updated ({} changes)", events.len()),
+        format_update_mail_body(fetched_at, events),
+    )
+}
+
+fn format_initial_mail_body(
+    fetched_at: &str,
+    team_count: usize,
+    events: &[crate::diff::TeamEvent],
+) -> String {
+    let mut lines = vec![
+        format!("Initial leaderboard snapshot created at {fetched_at}"),
+        format!("Tracked teams: {team_count}"),
+        String::new(),
+    ];
+    lines.extend(format_event_lines(events));
+    lines.join("\n")
+}
+
+fn format_update_mail_body(fetched_at: &str, events: &[crate::diff::TeamEvent]) -> String {
     let mut lines = vec![
         format!("Leaderboard updated at {fetched_at}"),
         String::new(),
     ];
-    for event in events {
-        let line = match event.event_type {
+    lines.extend(format_event_lines(events));
+    lines.join("\n")
+}
+
+fn format_event_lines(events: &[crate::diff::TeamEvent]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| match event.event_type {
             crate::diff::EventType::NewTeam => format!(
                 "+ {} rank={} score={:.4} version={}",
                 event.team_id,
@@ -145,10 +195,8 @@ fn format_mail_body(fetched_at: &str, events: &[crate::diff::TeamEvent]) -> Stri
                 event.new_score,
                 event.new_version
             ),
-        };
-        lines.push(line);
-    }
-    lines.join("\n")
+        })
+        .collect()
 }
 
 fn dummy(config: &config::Config, args: &DummyArgs) -> Result<()> {
@@ -196,8 +244,28 @@ mod tests {
             new_version: Some("v1".to_string()),
         }];
 
-        let body = format_mail_body("2026-05-07T00:00:00Z", &events);
+        let body = format_update_mail_body("2026-05-07T00:00:00Z", &events);
         assert!(body.contains("Leaderboard updated at"));
+        assert!(body.contains("+ alpha"));
+    }
+
+    #[test]
+    fn formats_initial_snapshot_mail_summary() {
+        let events = vec![TeamEvent {
+            team_id: "alpha".to_string(),
+            event_type: EventType::NewTeam,
+            old_rank: None,
+            new_rank: Some(1),
+            old_score: None,
+            new_score: Some(100.0),
+            old_version: None,
+            new_version: Some("v1".to_string()),
+        }];
+
+        let (subject, body) = build_notification_message(true, "2026-05-07T00:00:00Z", 1, &events);
+        assert!(subject.contains("Initial leaderboard snapshot created"));
+        assert!(body.contains("Initial leaderboard snapshot created at"));
+        assert!(body.contains("Tracked teams: 1"));
         assert!(body.contains("+ alpha"));
     }
 }
