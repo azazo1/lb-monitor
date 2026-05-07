@@ -1,8 +1,11 @@
 use std::cmp::{max, min};
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
@@ -50,11 +53,23 @@ pub fn run(config: &Config) -> Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let terminal = ratatui::init();
 
-    let result = run_app(terminal, conn, config.tui.refresh_seconds);
+    let result = run_app(
+        terminal,
+        conn,
+        config.database.path.clone(),
+        config.tui.refresh_seconds,
+    );
     ratatui::restore();
     disable_raw_mode()?;
     execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
     result
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.event_loader.shutdown();
+        self.chart_loader.shutdown();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,9 +91,13 @@ struct App {
     leaderboard: Vec<LeaderboardViewRow>,
     filtered_indices: Vec<usize>,
     events: Vec<EventViewRow>,
+    events_scope: Option<String>,
+    events_loading: bool,
     selected_team: Option<String>,
     compare_teams: BTreeSet<String>,
     chart_series: HashMap<String, Vec<ChartPoint>>,
+    chart_scope: Vec<String>,
+    chart_loading: bool,
     chart_mode: ChartMode,
     focus: Focus,
     table_state: TableState,
@@ -93,6 +112,8 @@ struct App {
     last_refresh: Instant,
     status: String,
     last_click: Option<ClickInfo>,
+    event_loader: LoaderState<EventLoadRequest, EventLoadResponse>,
+    chart_loader: LoaderState<ChartLoadRequest, ChartLoadResponse>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,17 +131,77 @@ struct ViewLayout {
     status: Rect,
 }
 
+enum LoaderCommand<Request> {
+    Load(Request),
+    Shutdown,
+}
+
+struct LoaderState<Request, Response> {
+    tx: Sender<LoaderCommand<Request>>,
+    rx: Receiver<Response>,
+    handle: Option<JoinHandle<()>>,
+    next_request_id: u64,
+    latest_request_id: u64,
+}
+
+impl<Request, Response> LoaderState<Request, Response> {
+    fn issue_request_id(&mut self) -> u64 {
+        self.next_request_id += 1;
+        self.latest_request_id = self.next_request_id;
+        self.latest_request_id
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.tx.send(LoaderCommand::Shutdown);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EventLoadRequest {
+    request_id: u64,
+    team_filter: Option<String>,
+}
+
+#[derive(Debug)]
+struct EventLoadResponse {
+    request_id: u64,
+    team_filter: Option<String>,
+    result: std::result::Result<Vec<EventViewRow>, String>,
+}
+
+#[derive(Debug)]
+struct ChartLoadRequest {
+    request_id: u64,
+    team_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ChartLoadResponse {
+    request_id: u64,
+    team_ids: Vec<String>,
+    result: std::result::Result<HashMap<String, Vec<ChartPoint>>, String>,
+}
+
 impl App {
-    fn new(conn: rusqlite::Connection, refresh_seconds: u64) -> Result<Self> {
+    fn new(conn: rusqlite::Connection, db_path: PathBuf, refresh_seconds: u64) -> Result<Self> {
+        let event_loader = spawn_event_loader(db_path.clone());
+        let chart_loader = spawn_chart_loader(db_path.clone());
         let mut app = Self {
             conn,
             latest_snapshot_id: None,
             leaderboard: Vec::new(),
             filtered_indices: Vec::new(),
             events: Vec::new(),
+            events_scope: None,
+            events_loading: false,
             selected_team: None,
             compare_teams: BTreeSet::new(),
             chart_series: HashMap::new(),
+            chart_scope: Vec::new(),
+            chart_loading: false,
             chart_mode: ChartMode::Score,
             focus: Focus::Table,
             table_state: TableState::default(),
@@ -135,6 +216,8 @@ impl App {
             last_refresh: Instant::now() - Duration::from_secs(refresh_seconds.max(1)),
             status: String::new(),
             last_click: None,
+            event_loader,
+            chart_loader,
         };
         app.reload(true)?;
         Ok(app)
@@ -148,8 +231,7 @@ impl App {
         self.latest_snapshot_id = current_snapshot_id;
         self.leaderboard = latest_leaderboard(&self.conn)?;
         self.apply_filter();
-        self.refresh_events()?;
-        self.reload_chart_series()?;
+        self.schedule_dependent_loads()?;
         self.last_refresh = Instant::now();
         self.status = format!(
             "snapshot={} teams={} compare={}",
@@ -160,17 +242,124 @@ impl App {
         Ok(())
     }
 
-    fn reload_chart_series(&mut self) -> Result<()> {
-        let teams: Vec<String> = if self.compare_teams.is_empty() {
-            self.selected_team
-                .iter()
-                .cloned()
-                .collect()
+    fn schedule_dependent_loads(&mut self) -> Result<()> {
+        self.schedule_event_refresh()?;
+        self.schedule_chart_reload()?;
+        Ok(())
+    }
+
+    fn schedule_selection_loads(&mut self) -> Result<()> {
+        self.schedule_event_refresh()?;
+        if self.compare_teams.is_empty() {
+            self.schedule_chart_reload()?;
+        }
+        Ok(())
+    }
+
+    fn schedule_event_refresh(&mut self) -> Result<()> {
+        let selected_team = self.selected_team.clone();
+        let request_id = self.event_loader.issue_request_id();
+        self.events_loading = true;
+        self.events_scope = selected_team.clone();
+        self.event_scroll = 0;
+        self.event_loader
+            .tx
+            .send(LoaderCommand::Load(EventLoadRequest {
+                request_id,
+                team_filter: selected_team,
+            }))
+            .map_err(|_| anyhow!("event loader thread stopped unexpectedly"))?;
+        Ok(())
+    }
+
+    fn schedule_chart_reload(&mut self) -> Result<()> {
+        let team_ids = self.chart_team_ids();
+        let request_id = self.chart_loader.issue_request_id();
+        self.chart_loading = !team_ids.is_empty();
+        self.chart_scope = team_ids.clone();
+        if team_ids.is_empty() {
+            self.chart_series.clear();
+            return Ok(());
+        }
+        self.chart_loader
+            .tx
+            .send(LoaderCommand::Load(ChartLoadRequest {
+                request_id,
+                team_ids,
+            }))
+            .map_err(|_| anyhow!("chart loader thread stopped unexpectedly"))?;
+        Ok(())
+    }
+
+    fn chart_team_ids(&self) -> Vec<String> {
+        if self.compare_teams.is_empty() {
+            self.selected_team.iter().cloned().collect()
         } else {
             self.compare_teams.iter().cloned().collect()
-        };
-        self.chart_series = team_chart_series(&self.conn, &teams)?;
-        Ok(())
+        }
+    }
+
+    fn poll_async_updates(&mut self) {
+        self.poll_event_updates();
+        self.poll_chart_updates();
+    }
+
+    fn poll_event_updates(&mut self) {
+        loop {
+            match self.event_loader.rx.try_recv() {
+                Ok(response) => {
+                    if response.request_id != self.event_loader.latest_request_id {
+                        continue;
+                    }
+                    self.events_loading = false;
+                    match response.result {
+                        Ok(events) => {
+                            self.events = events;
+                            self.events_scope = response.team_filter;
+                            self.event_scroll =
+                                self.event_scroll.min(self.events.len().saturating_sub(1));
+                        }
+                        Err(error) => {
+                            self.status = format!("failed to load events: {}", error);
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.events_loading = false;
+                    self.status = "event loader disconnected".to_string();
+                    break;
+                }
+            }
+        }
+    }
+
+    fn poll_chart_updates(&mut self) {
+        loop {
+            match self.chart_loader.rx.try_recv() {
+                Ok(response) => {
+                    if response.request_id != self.chart_loader.latest_request_id {
+                        continue;
+                    }
+                    self.chart_loading = false;
+                    match response.result {
+                        Ok(series) => {
+                            self.chart_series = series;
+                            self.chart_scope = response.team_ids;
+                        }
+                        Err(error) => {
+                            self.status = format!("failed to load chart: {}", error);
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.chart_loading = false;
+                    self.status = "chart loader disconnected".to_string();
+                    break;
+                }
+            }
+        }
     }
 
     fn apply_filter(&mut self) {
@@ -188,7 +377,9 @@ impl App {
             .selected()
             .unwrap_or(0)
             .min(self.filtered_indices.len().saturating_sub(1));
-        self.table_scroll = self.table_scroll.min(self.filtered_indices.len().saturating_sub(1));
+        self.table_scroll = self
+            .table_scroll
+            .min(self.filtered_indices.len().saturating_sub(1));
         if self.filtered_indices.is_empty() {
             self.table_state.select(None);
             self.selected_team = None;
@@ -206,13 +397,6 @@ impl App {
         }
     }
 
-    fn refresh_events(&mut self) -> Result<()> {
-        let selected_team = self.selected_team.clone();
-        self.events = recent_events(&self.conn, selected_team.as_deref(), RECENT_EVENTS_LIMIT)?;
-        self.event_scroll = self.event_scroll.min(self.events.len().saturating_sub(1));
-        Ok(())
-    }
-
     fn move_selection(&mut self, delta: isize) -> Result<()> {
         if self.filtered_indices.is_empty() {
             return Ok(());
@@ -222,8 +406,7 @@ impl App {
         let next = min(max(current + delta, 0), len - 1) as usize;
         self.table_state.select(Some(next));
         self.sync_selected_team();
-        self.refresh_events()?;
-        self.reload_chart_series()?;
+        self.schedule_selection_loads()?;
         Ok(())
     }
 
@@ -234,8 +417,7 @@ impl App {
         let next = selected.min(self.filtered_indices.len().saturating_sub(1));
         self.table_state.select(Some(next));
         self.sync_selected_team();
-        self.refresh_events()?;
-        self.reload_chart_series()?;
+        self.schedule_selection_loads()?;
         Ok(())
     }
 
@@ -270,10 +452,7 @@ impl App {
             self.event_scroll = 0;
             return;
         }
-        let max_scroll = self
-            .events
-            .len()
-            .saturating_sub(self.event_page_capacity());
+        let max_scroll = self.events.len().saturating_sub(self.event_page_capacity());
         let next = (self.event_scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
         self.event_scroll = next;
     }
@@ -285,10 +464,14 @@ impl App {
         if !self.compare_teams.insert(team_id.clone()) {
             self.compare_teams.remove(&team_id);
         }
-        self.reload_chart_series()?;
         if !self.filtered_indices.is_empty() {
             self.move_selection(1)?;
             self.ensure_selection_visible();
+        } else {
+            self.schedule_selection_loads()?;
+        }
+        if !self.compare_teams.is_empty() {
+            self.schedule_chart_reload()?;
         }
         Ok(())
     }
@@ -309,8 +492,7 @@ impl App {
         if let Some(team_id) = preserve_team {
             self.select_team_by_id(&team_id)?;
         } else {
-            self.refresh_events()?;
-            self.reload_chart_series()?;
+            self.schedule_dependent_loads()?;
         }
         Ok(())
     }
@@ -481,10 +663,102 @@ impl App {
     }
 }
 
-fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_seconds: u64) -> Result<()> {
-    let mut app = App::new(conn, refresh_seconds)?;
+fn spawn_event_loader(db_path: PathBuf) -> LoaderState<EventLoadRequest, EventLoadResponse> {
+    let (tx, rx_commands) = mpsc::channel::<LoaderCommand<EventLoadRequest>>();
+    let (tx_results, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        while let Ok(command) = rx_commands.recv() {
+            match command {
+                LoaderCommand::Load(mut request) => {
+                    while let Ok(next_command) = rx_commands.try_recv() {
+                        match next_command {
+                            LoaderCommand::Load(next_request) => request = next_request,
+                            LoaderCommand::Shutdown => return,
+                        }
+                    }
+                    let result = open_ro(&db_path)
+                        .and_then(|conn| {
+                            recent_events(
+                                &conn,
+                                request.team_filter.as_deref(),
+                                RECENT_EVENTS_LIMIT,
+                            )
+                        })
+                        .map_err(|error| error.to_string());
+                    if tx_results
+                        .send(EventLoadResponse {
+                            request_id: request.request_id,
+                            team_filter: request.team_filter,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                LoaderCommand::Shutdown => return,
+            }
+        }
+    });
+    LoaderState {
+        tx,
+        rx,
+        handle: Some(handle),
+        next_request_id: 0,
+        latest_request_id: 0,
+    }
+}
+
+fn spawn_chart_loader(db_path: PathBuf) -> LoaderState<ChartLoadRequest, ChartLoadResponse> {
+    let (tx, rx_commands) = mpsc::channel::<LoaderCommand<ChartLoadRequest>>();
+    let (tx_results, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        while let Ok(command) = rx_commands.recv() {
+            match command {
+                LoaderCommand::Load(mut request) => {
+                    while let Ok(next_command) = rx_commands.try_recv() {
+                        match next_command {
+                            LoaderCommand::Load(next_request) => request = next_request,
+                            LoaderCommand::Shutdown => return,
+                        }
+                    }
+                    let result = open_ro(&db_path)
+                        .and_then(|conn| team_chart_series(&conn, &request.team_ids))
+                        .map_err(|error| error.to_string());
+                    if tx_results
+                        .send(ChartLoadResponse {
+                            request_id: request.request_id,
+                            team_ids: request.team_ids,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                LoaderCommand::Shutdown => return,
+            }
+        }
+    });
+    LoaderState {
+        tx,
+        rx,
+        handle: Some(handle),
+        next_request_id: 0,
+        latest_request_id: 0,
+    }
+}
+
+fn run_app(
+    mut terminal: DefaultTerminal,
+    conn: rusqlite::Connection,
+    db_path: PathBuf,
+    refresh_seconds: u64,
+) -> Result<()> {
+    let mut app = App::new(conn, db_path, refresh_seconds)?;
 
     loop {
+        app.poll_async_updates();
         terminal.draw(|frame| render(frame, &app))?;
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
@@ -504,7 +778,7 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
                             KeyCode::Enter => {
                                 app.search_mode = false;
                                 app.apply_filter();
-                                app.refresh_events()?;
+                                app.schedule_selection_loads()?;
                             }
                             KeyCode::Backspace => {
                                 app.search_input.pop();
@@ -547,28 +821,24 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
                         KeyCode::Tab => app.cycle_focus(),
                         KeyCode::Char('J') => app.scroll_events(1),
                         KeyCode::Char('K') => app.scroll_events(-1),
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            match app.focus {
-                                Focus::Table => {
-                                    app.move_selection(1)?;
-                                    app.ensure_selection_visible();
-                                }
-                                Focus::Events => app.scroll_events(1),
-                                Focus::Chart => {}
+                        KeyCode::Down | KeyCode::Char('j') => match app.focus {
+                            Focus::Table => {
+                                app.move_selection(1)?;
+                                app.ensure_selection_visible();
                             }
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            match app.focus {
-                                Focus::Table => {
-                                    app.move_selection(-1)?;
-                                    app.ensure_selection_visible();
-                                }
-                                Focus::Events => app.scroll_events(-1),
-                                Focus::Chart => {}
+                            Focus::Events => app.scroll_events(1),
+                            Focus::Chart => {}
+                        },
+                        KeyCode::Up | KeyCode::Char('k') => match app.focus {
+                            Focus::Table => {
+                                app.move_selection(-1)?;
+                                app.ensure_selection_visible();
                             }
-                        }
+                            Focus::Events => app.scroll_events(-1),
+                            Focus::Chart => {}
+                        },
                         KeyCode::Enter => {
-                            app.refresh_events()?;
+                            app.schedule_event_refresh()?;
                         }
                         KeyCode::Char(' ') => app.toggle_compare()?,
                         _ => {}
@@ -596,6 +866,8 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
             }
         }
 
+        app.poll_async_updates();
+
         if app.last_refresh.elapsed() >= app.refresh_every {
             app.reload(false)?;
         }
@@ -611,7 +883,11 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     render_chart(frame, layout.chart, app);
     render_status(frame, layout.status, app);
     if app.show_help {
-        render_help(frame, frame.area(), app.chart_fullscreen || app.event_fullscreen);
+        render_help(
+            frame,
+            frame.area(),
+            app.chart_fullscreen || app.event_fullscreen,
+        );
     }
 }
 
@@ -619,7 +895,9 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let start = app.table_scroll.min(app.filtered_indices.len().saturating_sub(1));
+    let start = app
+        .table_scroll
+        .min(app.filtered_indices.len().saturating_sub(1));
     let visible_rows = table_visible_rows(area);
     let end = min(start + visible_rows, app.filtered_indices.len());
     let rows: Vec<Row<'_>> = app
@@ -638,7 +916,11 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .score_delta
                 .map(format_score_delta)
                 .unwrap_or_else(|| "-".to_string());
-            let marker = if app.compare_teams.contains(&row.team_id) { "*" } else { " " };
+            let marker = if app.compare_teams.contains(&row.team_id) {
+                "*"
+            } else {
+                " "
+            };
             Row::new(vec![
                 Cell::from(marker.to_string()),
                 Cell::from(row.rank.to_string()),
@@ -671,8 +953,21 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ],
     )
     .header(
-        Row::new(vec!["*", "Rank", "Delta", "Team", "Score", "Score Delta", "Version", "Last Seen"])
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Row::new(vec![
+            "*",
+            "Rank",
+            "Delta",
+            "Team",
+            "Score",
+            "Score Delta",
+            "Version",
+            "Last Seen",
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
     )
     .block(
         Block::default()
@@ -696,10 +991,30 @@ fn render_events(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let title = match &app.selected_team {
+    let mut title = match &app.selected_team {
         Some(team_id) => format!("Events {}", team_id),
         None => "Recent Events".to_string(),
     };
+    if app.events_loading {
+        title.push_str(" (loading)");
+    }
+    if app.events_loading || app.events.is_empty() {
+        let message = if app.events_loading {
+            "Loading events..."
+        } else {
+            "No events"
+        };
+        let placeholder = Paragraph::new(message)
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(border_style(app.focus == Focus::Events)),
+            )
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(placeholder, area);
+        return;
+    }
     let visible_rows = events_visible_rows(area);
     let items: Vec<ListItem<'_>> = app
         .events
@@ -721,26 +1036,36 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let title = if app.chart_mode == ChartMode::Score {
+    let chart_team_ids = app.chart_team_ids();
+    let mut title = if app.chart_mode == ChartMode::Score {
         if app.compare_teams.is_empty() {
-            "Score Chart (current team)"
+            "Score Chart (current team)".to_string()
         } else {
-            "Score Chart"
+            "Score Chart".to_string()
         }
     } else {
-        "Rank Chart"
+        "Rank Chart".to_string()
     };
+    if app.chart_loading {
+        title.push_str(" (loading)");
+    }
+    if app.chart_loading {
+        let placeholder = Paragraph::new("Loading chart...")
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(border_style(app.focus == Focus::Chart)),
+            )
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(placeholder, area);
+        return;
+    }
     let mut chart_data = Vec::new();
     let mut min_x = i64::MAX;
     let mut max_x = i64::MIN;
     let mut max_y = 0.0_f64;
     let mut min_y = f64::MAX;
-
-    let chart_team_ids: Vec<String> = if app.compare_teams.is_empty() {
-        app.selected_team.iter().cloned().collect()
-    } else {
-        app.compare_teams.iter().cloned().collect()
-    };
 
     for team_id in &chart_team_ids {
         let points = app.chart_series.get(team_id).cloned().unwrap_or_default();
@@ -765,7 +1090,12 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     if chart_data.is_empty() {
-        let placeholder = Paragraph::new("No team selected")
+        let message = if chart_team_ids.is_empty() {
+            "No team selected"
+        } else {
+            "No chart data"
+        };
+        let placeholder = Paragraph::new(message)
             .block(
                 Block::default()
                     .title(title)
@@ -794,7 +1124,11 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         format_timestamp_short_unix(min_x),
         format_timestamp_short_unix(max_x),
     ];
-    let y_start = if min_y.is_finite() { min_y.floor() } else { 0.0 };
+    let y_start = if min_y.is_finite() {
+        min_y.floor()
+    } else {
+        0.0
+    };
     let y_end = if max_y.is_finite() { max_y.ceil() } else { 1.0 };
     let y_mid = y_start + (y_end.max(y_start + 1.0) - y_start) / 2.0;
     let y_title = match app.chart_mode {
@@ -818,22 +1152,23 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Axis::default()
                 .title(y_title)
                 .bounds([y_start, y_end.max(y_start + 1.0)])
-                .labels(
-                    vec![
-                        Line::from(format_chart_value(app.chart_mode, y_start)),
-                        Line::from(format_chart_value(app.chart_mode, y_mid)),
-                        Line::from(format_chart_value(app.chart_mode, y_end.max(y_start + 1.0))),
-                    ],
-                ),
+                .labels(vec![
+                    Line::from(format_chart_value(app.chart_mode, y_start)),
+                    Line::from(format_chart_value(app.chart_mode, y_mid)),
+                    Line::from(format_chart_value(app.chart_mode, y_end.max(y_start + 1.0))),
+                ]),
         );
     frame.render_widget(chart, area);
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let selected = app
-        .selected_team
-        .as_deref()
-        .unwrap_or("-");
+    let selected = app.selected_team.as_deref().unwrap_or("-");
+    let loading = match (app.events_loading, app.chart_loading) {
+        (true, true) => "loading=events+chart",
+        (true, false) => "loading=events",
+        (false, true) => "loading=chart",
+        (false, false) => "loading=idle",
+    };
     let hints = if app.search_mode {
         "/ search  Esc clear  Enter apply  q quit"
     } else if app.show_help {
@@ -842,10 +1177,11 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "q quit  / search  h help  o chart  O events  t metric  [ ] page  g/G jump"
     };
     let help = format!(
-        "{} | selected={} focus={:?} | {}",
-        hints, selected, app.focus, app.status
+        "{} | selected={} focus={:?} | {} | {}",
+        hints, selected, app.focus, loading, app.status
     );
-    let paragraph = Paragraph::new(help).block(Block::default().borders(Borders::ALL).title("Status"));
+    let paragraph =
+        Paragraph::new(help).block(Block::default().borders(Borders::ALL).title("Status"));
     frame.render_widget(paragraph, area);
 }
 
@@ -932,7 +1268,11 @@ fn split_layout(area: Rect, chart_fullscreen: bool, event_fullscreen: bool) -> V
     }
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(37), Constraint::Length(3)])
+        .constraints([
+            Constraint::Percentage(58),
+            Constraint::Percentage(37),
+            Constraint::Length(3),
+        ])
         .split(area);
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
@@ -1008,11 +1348,15 @@ fn format_rank_delta(delta: Option<i64>) -> String {
 
 fn rank_delta_style(is_new: bool, delta: Option<i64>) -> Style {
     if is_new {
-        return Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+        return Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
     }
 
     match delta {
-        Some(value) if value > 0 => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Some(value) if value > 0 => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
         Some(value) if value < 0 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         _ => Style::default().fg(Color::DarkGray),
     }

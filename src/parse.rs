@@ -149,10 +149,9 @@ fn parse_bundle_rows(bundle: &str) -> Vec<LeaderboardRow> {
         return Vec::new();
     };
 
-    let entry_regex = Regex::new(
-        r#"\{rank:(\d+),team:"([^"]+)",score:([0-9.]+),version:"([^"]+)"\}"#,
-    )
-    .expect("regex");
+    let entry_regex =
+        Regex::new(r#"\{rank:(\d+),team:"([^"]+)",score:([0-9.]+),version:"([^"]+)"\}"#)
+            .expect("regex");
 
     entry_regex
         .captures_iter(&array_match)

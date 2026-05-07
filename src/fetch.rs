@@ -3,7 +3,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 
-use crate::parse::{LeaderboardPage, extract_bundle_path, parse_leaderboard, parse_leaderboard_bundle};
+use crate::parse::{
+    LeaderboardPage, extract_bundle_path, parse_leaderboard, parse_leaderboard_bundle,
+};
 
 pub fn fetch_leaderboard(url: &str) -> Result<LeaderboardPage> {
     let client = Client::builder()

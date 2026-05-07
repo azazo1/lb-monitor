@@ -191,7 +191,10 @@ mod tests {
             missing_config.to_str().expect("utf8"),
         ]);
         let loaded = LoadedConfig::load(&cli).expect("load config");
-        assert_eq!(loaded.config.fetch.interval_seconds, DEFAULT_INTERVAL_SECONDS);
+        assert_eq!(
+            loaded.config.fetch.interval_seconds,
+            DEFAULT_INTERVAL_SECONDS
+        );
         assert_eq!(loaded.config.database.path, PathBuf::from(DEFAULT_DB_PATH));
     }
 
@@ -229,7 +232,10 @@ refresh_seconds = 9
         ]);
 
         let loaded = LoadedConfig::load(&cli).expect("load config");
-        assert_eq!(loaded.config.database.path, PathBuf::from("override.sqlite3"));
+        assert_eq!(
+            loaded.config.database.path,
+            PathBuf::from("override.sqlite3")
+        );
         assert_eq!(loaded.config.fetch.interval_seconds, 60);
         assert!(loaded.config.notify.enabled);
         assert_eq!(loaded.config.tui.refresh_seconds, 9);

@@ -5,8 +5,8 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{Duration, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::diff::{DiffResult, PreviousEntry};
 use crate::diff::diff_rows;
+use crate::diff::{DiffResult, PreviousEntry};
 use crate::parse::LeaderboardRow;
 
 #[derive(Debug, Clone)]
@@ -113,9 +113,11 @@ CREATE INDEX IF NOT EXISTS idx_team_events_team_id ON team_events(team_id);
 }
 
 pub fn latest_snapshot_id(conn: &Connection) -> Result<Option<i64>> {
-    conn.query_row("SELECT id FROM snapshots ORDER BY id DESC LIMIT 1", [], |row| {
-        row.get(0)
-    })
+    conn.query_row(
+        "SELECT id FROM snapshots ORDER BY id DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
     .optional()
     .context("failed to query latest snapshot id")
 }
@@ -177,7 +179,12 @@ fn insert_snapshot_at(
 INSERT INTO snapshots (fetched_at, source_updated_at, content_hash, row_count)
 VALUES (?1, ?2, ?3, ?4)
 "#,
-        params![fetched_at, source_updated_at, diff.content_hash, rows.len() as i64],
+        params![
+            fetched_at,
+            source_updated_at,
+            diff.content_hash,
+            rows.len() as i64
+        ],
     )?;
     let snapshot_id = transaction.last_insert_rowid();
 
@@ -231,7 +238,9 @@ INSERT INTO team_events (
         )?;
     }
 
-    transaction.commit().context("failed to commit transaction")?;
+    transaction
+        .commit()
+        .context("failed to commit transaction")?;
     Ok(fetched_at.to_string())
 }
 
@@ -324,7 +333,11 @@ ORDER BY se.rank ASC, t.external_team_id ASC
     Ok(result)
 }
 
-pub fn recent_events(conn: &Connection, team_filter: Option<&str>, limit: usize) -> Result<Vec<EventViewRow>> {
+pub fn recent_events(
+    conn: &Connection,
+    team_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<EventViewRow>> {
     let query = if team_filter.is_some() {
         r#"
 SELECT s.fetched_at, t.external_team_id, te.event_type, te.old_rank, te.new_rank, te.old_score, te.new_score, te.old_version, te.new_version
@@ -372,7 +385,10 @@ fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventViewRow> {
     })
 }
 
-pub fn team_chart_series(conn: &Connection, team_ids: &[String]) -> Result<HashMap<String, Vec<ChartPoint>>> {
+pub fn team_chart_series(
+    conn: &Connection,
+    team_ids: &[String],
+) -> Result<HashMap<String, Vec<ChartPoint>>> {
     let mut result = HashMap::new();
     for team_id in team_ids {
         let mut statement = conn.prepare(
@@ -388,12 +404,13 @@ ORDER BY s.id ASC
         )?;
         let rows = statement.query_map([team_id], |row| {
             let fetched_at: String = row.get(0)?;
-            let parsed = chrono::DateTime::parse_from_rfc3339(&fetched_at)
-                .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+            let parsed = chrono::DateTime::parse_from_rfc3339(&fetched_at).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
                     0,
                     rusqlite::types::Type::Text,
                     Box::new(error),
-                ))?;
+                )
+            })?;
             Ok(ChartPoint {
                 timestamp: parsed.timestamp(),
                 score: row.get(1)?,
@@ -413,7 +430,9 @@ pub fn assert_has_snapshots(conn: &Connection) -> Result<()> {
     if latest_snapshot_id(conn)?.is_some() {
         Ok(())
     } else {
-        Err(anyhow!("database has no snapshots yet, start `lb-monitor serve` first"))
+        Err(anyhow!(
+            "database has no snapshots yet, start `lb-monitor serve` first"
+        ))
     }
 }
 

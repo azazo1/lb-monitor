@@ -3,7 +3,11 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "lb-monitor", version, about = "Leaderboard monitor with SQLite-backed TUI")]
+#[command(
+    name = "lb-monitor",
+    version,
+    about = "Leaderboard monitor with SQLite-backed TUI"
+)]
 pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
