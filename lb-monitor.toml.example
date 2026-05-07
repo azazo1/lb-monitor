@@ -13,12 +13,12 @@ enabled = false
 
 [serve.mail.smtp]
 host = "smtp.example.com"
-port = 587
+port = 465
 username = "user@example.com"
 password = "secret"
 from = "sender@example.com"
 to = ["alpha@example.com", "beta@example.com"]
-security = "starttls"
+security = "tls" # plain / starttls / tls
 
 [tui]
 refresh_seconds = 5

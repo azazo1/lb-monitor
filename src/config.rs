@@ -14,7 +14,7 @@ const DEFAULT_TUI_API_BASE_URL: &str = "http://127.0.0.1:8080";
 const DEFAULT_SERVE_LISTEN_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_FETCH_INTERVAL_SECONDS: u64 = 300;
 const DEFAULT_TUI_REFRESH_SECONDS: u64 = 5;
-const DEFAULT_SMTP_PORT: u16 = 587;
+const DEFAULT_SMTP_PORT: u16 = 465;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -167,7 +167,7 @@ impl Default for Config {
                         password: None,
                         from: None,
                         to: Vec::new(),
-                        security: SmtpSecurity::StartTls,
+                        security: SmtpSecurity::Tls,
                     },
                 },
             },
