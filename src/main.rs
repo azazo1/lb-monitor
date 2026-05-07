@@ -27,10 +27,15 @@ use crate::notify::{MailNotifier, NoopNotifier, Notifier};
 fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
+    let resolved_command = cli
+        .command
+        .clone()
+        .unwrap_or(Command::Tui(Default::default()));
     let loaded = LoadedConfig::load(&cli)?;
+    let command_summary = loaded.config.redacted_command_summary(&resolved_command);
 
-    info!(command = ?cli.command, "starting lb-monitor");
-    match cli.command.unwrap_or(Command::Tui(Default::default())) {
+    info!(command = %command_summary, "starting lb-monitor");
+    match resolved_command {
         Command::Tui(_) => tui::run(&loaded.config),
         Command::Serve(args) => serve(&loaded.config, args.once),
         Command::Dummy(args) => dummy(&loaded.config, &args),

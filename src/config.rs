@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::cli::{Cli, Command, ServeArgs, TuiArgs};
 
@@ -260,6 +261,40 @@ impl LoadedConfig {
     }
 }
 
+impl Config {
+    pub fn redacted_command_summary(&self, command: &Command) -> String {
+        match command {
+            Command::Tui(_) => format!(
+                "Tui(Config {{ database_path: {:?}, refresh_seconds: {}, source: {:?}, api_base_url: {:?} }})",
+                self.tui.database_path,
+                self.tui.refresh_seconds,
+                self.tui.source,
+                self.tui.api_base_url,
+            ),
+            Command::Serve(args) => format!(
+                "Serve(Config {{ database_path: {:?}, fetch_url: {:?}, interval_seconds: {}, listen: {:?}, once: {}, mail_enabled: {}, smtp_host: {:?}, smtp_port: {}, smtp_username: {}, smtp_password: {}, smtp_from: {}, smtp_to: {}, smtp_security: {:?} }})",
+                self.database.path,
+                self.serve.fetch.url,
+                self.serve.fetch.interval_seconds,
+                self.serve.http.listen,
+                args.once,
+                self.serve.mail.enabled,
+                self.serve.mail.smtp.host,
+                self.serve.mail.smtp.port,
+                redact_option(&self.serve.mail.smtp.username),
+                redact_option(&self.serve.mail.smtp.password),
+                redact_option(&self.serve.mail.smtp.from),
+                redact_vec(&self.serve.mail.smtp.to),
+                self.serve.mail.smtp.security,
+            ),
+            Command::Dummy(args) => format!(
+                "Dummy(Config {{ database_path: {:?}, snapshots: {}, teams: {} }})",
+                self.database.path, args.snapshots, args.teams,
+            ),
+        }
+    }
+}
+
 fn apply_fetch_overrides(target: &mut FetchConfig, source: FileFetchConfig) {
     if let Some(url) = source.url {
         target.url = url;
@@ -371,8 +406,25 @@ fn parse_tui_source(value: &str) -> Option<TuiSource> {
     }
 }
 
+fn redact_option<T>(value: &Option<T>) -> String {
+    if value.is_some() {
+        "Some(<redacted>)".to_string()
+    } else {
+        "None".to_string()
+    }
+}
+
+fn redact_vec(values: &[String]) -> String {
+    if values.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("[<redacted>; {}]", values.len())
+    }
+}
+
 fn load_file_config(path: &Path) -> Result<FileConfig> {
     if !path.exists() {
+        warn!(path = %path.display(), "config does not exist, use default config instead");
         return Ok(FileConfig::default());
     }
 
@@ -385,7 +437,7 @@ fn load_file_config(path: &Path) -> Result<FileConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Cli, Command, TuiArgs};
+    use crate::cli::{Cli, Command, ServeArgs, TuiArgs};
     use tempfile::tempdir;
 
     #[test]
@@ -502,5 +554,38 @@ database_path = "tui.sqlite3"
             loaded.config.tui.database_path,
             PathBuf::from("tui.sqlite3")
         );
+    }
+
+    #[test]
+    fn redacted_summary_uses_effective_serve_config() {
+        let cli = Cli {
+            config: None,
+            db: None,
+            command: Some(Command::Serve(ServeArgs {
+                interval: None,
+                listen: None,
+                once: false,
+                notify: false,
+                no_notify: false,
+                smtp_host: None,
+                smtp_port: None,
+                smtp_username: None,
+                smtp_password: None,
+                smtp_from: None,
+                smtp_to: Vec::new(),
+                smtp_security: None,
+            })),
+        };
+        let loaded = LoadedConfig::load(&cli).expect("load config");
+        let summary = loaded
+            .config
+            .redacted_command_summary(cli.command.as_ref().expect("command"));
+
+        assert!(summary.contains("interval_seconds: 300"));
+        assert!(summary.contains("listen: \"127.0.0.1:8080\""));
+        assert!(summary.contains("smtp_port: 465"));
+        assert!(summary.contains("smtp_security: Tls"));
+        assert!(!summary.contains("interval: None"));
+        assert!(!summary.contains("listen: None"));
     }
 }
