@@ -4,6 +4,8 @@ For [https://dataagent.top/leaderboard](https://dataagent.top/leaderboard).
 
 The service keeps SQLite as the source of truth, exposes a read-only JSON API, and can send email when the leaderboard changes.
 
+By default, config is read from `~/.config/lbm/config.toml`. Use `--config <path>` to override it. Path values inside config support `shellexpand`, such as `~`, `$HOME`, and `${VAR:-default}`.
+
 Config is grouped by command:
 
 ```toml

@@ -4,3 +4,4 @@ lb-monitor.toml
 *.sqlite3-*
 *.db
 outputs/
+config.toml

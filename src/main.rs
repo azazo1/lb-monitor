@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tokio::runtime::Builder;
 use tokio::task;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -27,8 +28,7 @@ use crate::diff::diff_rows;
 use crate::fetch::fetch_leaderboard;
 use crate::notify::{MailNotifier, NoopNotifier, Notifier};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let resolved_command = cli
@@ -41,9 +41,17 @@ async fn main() -> Result<()> {
     info!(command = %command_summary, "starting lb-monitor");
     match resolved_command {
         Command::Tui(_) => tui::run(&loaded.config),
-        Command::Serve(args) => serve(&loaded.config, args.once).await,
+        Command::Serve(args) => build_runtime()?
+            .block_on(serve(&loaded.config, args.once)),
         Command::Dummy(args) => dummy(&loaded.config, &args),
     }
+}
+
+fn build_runtime() -> Result<tokio::runtime::Runtime> {
+    Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")
 }
 
 async fn serve(config: &config::Config, once: bool) -> Result<()> {
