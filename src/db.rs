@@ -37,6 +37,7 @@ pub struct EventViewRow {
 #[derive(Debug, Clone)]
 pub struct ChartPoint {
     pub timestamp: i64,
+    pub rank: i64,
     pub score: f64,
 }
 
@@ -377,6 +378,7 @@ pub fn team_chart_series(conn: &Connection, team_ids: &[String]) -> Result<HashM
         let mut statement = conn.prepare(
             r#"
 SELECT s.fetched_at, se.score
+     , se.rank
 FROM snapshot_entries se
 JOIN teams t ON t.id = se.team_id
 JOIN snapshots s ON s.id = se.snapshot_id
@@ -395,6 +397,7 @@ ORDER BY s.id ASC
             Ok(ChartPoint {
                 timestamp: parsed.timestamp(),
                 score: row.get(1)?,
+                rank: row.get(2)?,
             })
         })?;
         let mut series = Vec::new();

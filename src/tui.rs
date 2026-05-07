@@ -20,8 +20,8 @@ use ratatui::{
     symbols,
     text::Line,
     widgets::{
-        Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, List, ListItem, Paragraph,
-        Row, Table, TableState,
+        Axis, Block, Borders, Cell, Chart, Dataset, GraphType, List, ListItem, Paragraph, Row,
+        Table, TableState,
     },
 };
 
@@ -64,6 +64,12 @@ enum Focus {
     Chart,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChartMode {
+    Score,
+    Rank,
+}
+
 struct App {
     conn: rusqlite::Connection,
     latest_snapshot_id: Option<i64>,
@@ -73,6 +79,7 @@ struct App {
     selected_team: Option<String>,
     compare_teams: BTreeSet<String>,
     chart_series: HashMap<String, Vec<ChartPoint>>,
+    chart_mode: ChartMode,
     focus: Focus,
     table_state: TableState,
     table_scroll: usize,
@@ -114,6 +121,7 @@ impl App {
             selected_team: None,
             compare_teams: BTreeSet::new(),
             chart_series: HashMap::new(),
+            chart_mode: ChartMode::Score,
             focus: Focus::Table,
             table_state: TableState::default(),
             table_scroll: 0,
@@ -388,6 +396,13 @@ impl App {
         self.show_help = !self.show_help;
     }
 
+    fn toggle_chart_mode(&mut self) {
+        self.chart_mode = match self.chart_mode {
+            ChartMode::Score => ChartMode::Rank,
+            ChartMode::Rank => ChartMode::Score,
+        };
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
         let layout = current_view_layout(self.chart_fullscreen, self.event_fullscreen)?;
         match mouse.kind {
@@ -527,6 +542,7 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
                         KeyCode::Char(']') => app.page_by(1)?,
                         KeyCode::Char('o') => app.toggle_chart_fullscreen(),
                         KeyCode::Char('O') => app.toggle_event_fullscreen(),
+                        KeyCode::Char('t') => app.toggle_chart_mode(),
                         KeyCode::Char('h') => app.toggle_help(),
                         KeyCode::Tab => app.cycle_focus(),
                         KeyCode::Char('J') => app.scroll_events(1),
@@ -560,7 +576,14 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
                 }
                 Event::Mouse(mouse) => {
                     if app.show_help {
-                        app.toggle_help();
+                        match mouse.kind {
+                            MouseEventKind::Moved
+                            | MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                            | MouseEventKind::ScrollLeft
+                            | MouseEventKind::ScrollRight => {}
+                            _ => app.toggle_help(),
+                        }
                         continue;
                     }
                     app.handle_mouse(mouse)?;
@@ -698,10 +721,14 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let title = if app.compare_teams.is_empty() {
-        "Score Chart (current team)"
+    let title = if app.chart_mode == ChartMode::Score {
+        if app.compare_teams.is_empty() {
+            "Score Chart (current team)"
+        } else {
+            "Score Chart"
+        }
     } else {
-        "Score Chart"
+        "Rank Chart"
     };
     let mut chart_data = Vec::new();
     let mut min_x = i64::MAX;
@@ -725,9 +752,13 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .map(|point| {
                 min_x = min(min_x, point.timestamp);
                 max_x = max(max_x, point.timestamp);
-                min_y = min_y.min(point.score);
-                max_y = max_y.max(point.score);
-                (point.timestamp as f64, point.score)
+                let value = match app.chart_mode {
+                    ChartMode::Score => point.score,
+                    ChartMode::Rank => point.rank as f64,
+                };
+                min_y = min_y.min(value);
+                max_y = max_y.max(value);
+                (point.timestamp as f64, value)
             })
             .collect();
         chart_data.push((team_id.clone(), chart_points));
@@ -766,6 +797,10 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let y_start = if min_y.is_finite() { min_y.floor() } else { 0.0 };
     let y_end = if max_y.is_finite() { max_y.ceil() } else { 1.0 };
     let y_mid = y_start + (y_end.max(y_start + 1.0) - y_start) / 2.0;
+    let y_title = match app.chart_mode {
+        ChartMode::Score => "Score",
+        ChartMode::Rank => "Rank",
+    };
     let chart = Chart::new(datasets)
         .block(
             Block::default()
@@ -781,13 +816,13 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )
         .y_axis(
             Axis::default()
-                .title("Score")
+                .title(y_title)
                 .bounds([y_start, y_end.max(y_start + 1.0)])
                 .labels(
                     vec![
-                        Line::from(format!("{y_start:.3}")),
-                        Line::from(format!("{y_mid:.3}")),
-                        Line::from(format!("{:.3}", y_end.max(y_start + 1.0))),
+                        Line::from(format_chart_value(app.chart_mode, y_start)),
+                        Line::from(format_chart_value(app.chart_mode, y_mid)),
+                        Line::from(format_chart_value(app.chart_mode, y_end.max(y_start + 1.0))),
                     ],
                 ),
         );
@@ -804,7 +839,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else if app.show_help {
         "h/Esc close help  q quit"
     } else {
-        "q quit  / search  h help  o chart  O events  [ ] page  g/G jump"
+        "q quit  / search  h help  o chart  O events  t metric  [ ] page  g/G jump"
     };
     let help = format!(
         "{} | selected={} focus={:?} | {}",
@@ -832,6 +867,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, chart_fullscreen: bool) {
         Line::from("Space: add/remove selected team from chart compare"),
         Line::from("o: toggle chart fullscreen"),
         Line::from("O: toggle events fullscreen"),
+        Line::from("t: toggle score / rank chart"),
         Line::from("/: start search"),
         Line::from("Esc: clear search or exit fullscreen"),
         Line::from(""),
@@ -845,7 +881,10 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, chart_fullscreen: bool) {
         Line::from("h or Esc: close help"),
         Line::from("q: quit"),
     ];
-    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        popup,
+    );
     let paragraph = Paragraph::new(text)
         .style(Style::default().bg(Color::Black).fg(Color::White))
         .block(
@@ -1039,4 +1078,11 @@ fn format_event(event: &EventViewRow) -> String {
         score,
         version
     )
+}
+
+fn format_chart_value(mode: ChartMode, value: f64) -> String {
+    match mode {
+        ChartMode::Score => format!("{value:.3}"),
+        ChartMode::Rank => format!("{:.0}", value),
+    }
 }

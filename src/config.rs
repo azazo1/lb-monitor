@@ -183,7 +183,13 @@ mod tests {
 
     #[test]
     fn uses_defaults_when_config_missing() {
-        let cli = Cli::parse_from(["lb-monitor"]);
+        let dir = tempdir().expect("tempdir");
+        let missing_config = dir.path().join("missing.toml");
+        let cli = Cli::parse_from([
+            "lb-monitor",
+            "--config",
+            missing_config.to_str().expect("utf8"),
+        ]);
         let loaded = LoadedConfig::load(&cli).expect("load config");
         assert_eq!(loaded.config.fetch.interval_seconds, DEFAULT_INTERVAL_SECONDS);
         assert_eq!(loaded.config.database.path, PathBuf::from(DEFAULT_DB_PATH));
