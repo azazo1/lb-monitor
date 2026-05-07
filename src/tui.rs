@@ -4,9 +4,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEvent, MouseEventKind,
+    },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
+    },
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -42,13 +47,13 @@ pub fn run(config: &Config) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let terminal = ratatui::init();
 
     let result = run_app(terminal, conn, config.tui.refresh_seconds);
     ratatui::restore();
     disable_raw_mode()?;
-    execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
     result
 }
 
@@ -70,11 +75,31 @@ struct App {
     chart_series: HashMap<String, Vec<ChartPoint>>,
     focus: Focus,
     table_state: TableState,
+    table_scroll: usize,
+    event_scroll: usize,
     search_mode: bool,
     search_input: String,
+    chart_fullscreen: bool,
+    show_help: bool,
     refresh_every: Duration,
     last_refresh: Instant,
     status: String,
+    last_click: Option<ClickInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct ClickInfo {
+    focus: Focus,
+    team_id: Option<String>,
+    at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ViewLayout {
+    table: Rect,
+    events: Rect,
+    chart: Rect,
+    status: Rect,
 }
 
 impl App {
@@ -90,11 +115,16 @@ impl App {
             chart_series: HashMap::new(),
             focus: Focus::Table,
             table_state: TableState::default(),
+            table_scroll: 0,
+            event_scroll: 0,
             search_mode: false,
             search_input: String::new(),
+            chart_fullscreen: false,
+            show_help: false,
             refresh_every: Duration::from_secs(refresh_seconds.max(1)),
             last_refresh: Instant::now() - Duration::from_secs(refresh_seconds.max(1)),
             status: String::new(),
+            last_click: None,
         };
         app.reload(true)?;
         Ok(app)
@@ -108,9 +138,7 @@ impl App {
         self.latest_snapshot_id = current_snapshot_id;
         self.leaderboard = latest_leaderboard(&self.conn)?;
         self.apply_filter();
-
-        let selected_team = self.selected_team.clone();
-        self.events = recent_events(&self.conn, selected_team.as_deref(), RECENT_EVENTS_LIMIT)?;
+        self.refresh_events()?;
         self.reload_chart_series()?;
         self.last_refresh = Instant::now();
         self.status = format!(
@@ -143,6 +171,7 @@ impl App {
             .selected()
             .unwrap_or(0)
             .min(self.filtered_indices.len().saturating_sub(1));
+        self.table_scroll = self.table_scroll.min(self.filtered_indices.len().saturating_sub(1));
         if self.filtered_indices.is_empty() {
             self.table_state.select(None);
             self.selected_team = None;
@@ -160,6 +189,13 @@ impl App {
         }
     }
 
+    fn refresh_events(&mut self) -> Result<()> {
+        let selected_team = self.selected_team.clone();
+        self.events = recent_events(&self.conn, selected_team.as_deref(), RECENT_EVENTS_LIMIT)?;
+        self.event_scroll = self.event_scroll.min(self.events.len().saturating_sub(1));
+        Ok(())
+    }
+
     fn move_selection(&mut self, delta: isize) -> Result<()> {
         if self.filtered_indices.is_empty() {
             return Ok(());
@@ -169,8 +205,58 @@ impl App {
         let next = min(max(current + delta, 0), len - 1) as usize;
         self.table_state.select(Some(next));
         self.sync_selected_team();
-        self.events = recent_events(&self.conn, self.selected_team.as_deref(), RECENT_EVENTS_LIMIT)?;
+        self.refresh_events()?;
         Ok(())
+    }
+
+    fn set_selection(&mut self, selected: usize) -> Result<()> {
+        if self.filtered_indices.is_empty() {
+            return Ok(());
+        }
+        let next = selected.min(self.filtered_indices.len().saturating_sub(1));
+        self.table_state.select(Some(next));
+        self.sync_selected_team();
+        self.refresh_events()?;
+        Ok(())
+    }
+
+    fn table_page_capacity(&self) -> usize {
+        current_view_layout(self.chart_fullscreen)
+            .map(|layout| table_visible_rows(layout.table))
+            .unwrap_or(10)
+            .max(1)
+    }
+
+    fn event_page_capacity(&self) -> usize {
+        current_view_layout(self.chart_fullscreen)
+            .map(|layout| events_visible_rows(layout.events))
+            .unwrap_or(8)
+            .max(1)
+    }
+
+    fn ensure_selection_visible(&mut self) {
+        let Some(selected) = self.table_state.selected() else {
+            return;
+        };
+        let page = self.table_page_capacity();
+        if selected < self.table_scroll {
+            self.table_scroll = selected;
+        } else if selected >= self.table_scroll + page {
+            self.table_scroll = selected.saturating_sub(page.saturating_sub(1));
+        }
+    }
+
+    fn scroll_events(&mut self, delta: isize) {
+        if self.events.is_empty() {
+            self.event_scroll = 0;
+            return;
+        }
+        let max_scroll = self
+            .events
+            .len()
+            .saturating_sub(self.event_page_capacity());
+        let next = (self.event_scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
+        self.event_scroll = next;
     }
 
     fn toggle_compare(&mut self) -> Result<()> {
@@ -191,6 +277,146 @@ impl App {
             Focus::Chart => Focus::Table,
         };
     }
+
+    fn clear_search(&mut self) -> Result<()> {
+        self.search_mode = false;
+        self.search_input.clear();
+        self.apply_filter();
+        self.refresh_events()
+    }
+
+    fn jump_to_top(&mut self) -> Result<()> {
+        match self.focus {
+            Focus::Table => {
+                self.table_scroll = 0;
+                self.set_selection(0)?;
+            }
+            Focus::Events => {
+                self.event_scroll = 0;
+            }
+            Focus::Chart => {}
+        }
+        Ok(())
+    }
+
+    fn jump_to_bottom(&mut self) -> Result<()> {
+        match self.focus {
+            Focus::Table => {
+                let last = self.filtered_indices.len().saturating_sub(1);
+                self.set_selection(last)?;
+                self.ensure_selection_visible();
+            }
+            Focus::Events => {
+                self.event_scroll = self.events.len().saturating_sub(self.event_page_capacity());
+            }
+            Focus::Chart => {}
+        }
+        Ok(())
+    }
+
+    fn page_by(&mut self, delta: isize) -> Result<()> {
+        match self.focus {
+            Focus::Table => {
+                let step = self.table_page_capacity() as isize;
+                self.move_selection(delta * step)?;
+                self.ensure_selection_visible();
+            }
+            Focus::Events => {
+                let step = self.event_page_capacity() as isize;
+                self.scroll_events(delta * step);
+            }
+            Focus::Chart => {}
+        }
+        Ok(())
+    }
+
+    fn toggle_chart_fullscreen(&mut self) {
+        self.chart_fullscreen = !self.chart_fullscreen;
+        if self.chart_fullscreen {
+            self.focus = Focus::Chart;
+        }
+    }
+
+    fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        let layout = current_view_layout(self.chart_fullscreen)?;
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if contains(layout.table, mouse.column, mouse.row) {
+                    self.focus = Focus::Table;
+                    self.move_selection(-1)?;
+                    self.ensure_selection_visible();
+                } else if contains(layout.events, mouse.column, mouse.row) {
+                    self.focus = Focus::Events;
+                    self.scroll_events(-2);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if contains(layout.table, mouse.column, mouse.row) {
+                    self.focus = Focus::Table;
+                    self.move_selection(1)?;
+                    self.ensure_selection_visible();
+                } else if contains(layout.events, mouse.column, mouse.row) {
+                    self.focus = Focus::Events;
+                    self.scroll_events(2);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if contains(layout.table, mouse.column, mouse.row) {
+                    self.focus = Focus::Table;
+                    if let Some(clicked) =
+                        table_index_from_mouse(layout.table, mouse.row, self.table_scroll)
+                        && clicked < self.filtered_indices.len()
+                    {
+                        self.set_selection(clicked)?;
+                        self.ensure_selection_visible();
+                        let team_id = self.selected_team.clone();
+                        if self.is_double_click(Focus::Table, team_id.as_deref()) {
+                            self.toggle_compare()?;
+                            self.status = format!(
+                                "toggled compare for {}",
+                                team_id.unwrap_or_else(|| "-".to_string())
+                            );
+                        }
+                        self.last_click = Some(ClickInfo {
+                            focus: Focus::Table,
+                            team_id: self.selected_team.clone(),
+                            at: Instant::now(),
+                        });
+                    }
+                } else if contains(layout.events, mouse.column, mouse.row) {
+                    self.focus = Focus::Events;
+                    self.last_click = Some(ClickInfo {
+                        focus: Focus::Events,
+                        team_id: self.selected_team.clone(),
+                        at: Instant::now(),
+                    });
+                } else if contains(layout.chart, mouse.column, mouse.row) {
+                    self.focus = Focus::Chart;
+                    self.last_click = Some(ClickInfo {
+                        focus: Focus::Chart,
+                        team_id: None,
+                        at: Instant::now(),
+                    });
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn is_double_click(&self, focus: Focus, team_id: Option<&str>) -> bool {
+        let Some(last_click) = &self.last_click else {
+            return false;
+        };
+        last_click.focus == focus
+            && last_click.team_id.as_deref() == team_id
+            && last_click.at.elapsed() <= Duration::from_millis(450)
+    }
 }
 
 fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_seconds: u64) -> Result<()> {
@@ -199,62 +425,92 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
     loop {
         terminal.draw(|frame| render(frame, &app))?;
         if event::poll(Duration::from_millis(200))? {
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            if app.search_mode {
-                match key.code {
-                    KeyCode::Esc => {
-                        app.search_mode = false;
-                        app.search_input.clear();
-                        app.apply_filter();
-                        app.events =
-                            recent_events(&app.conn, app.selected_team.as_deref(), RECENT_EVENTS_LIMIT)?;
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
                     }
-                    KeyCode::Enter => {
-                        app.search_mode = false;
-                        app.apply_filter();
-                        app.events =
-                            recent_events(&app.conn, app.selected_team.as_deref(), RECENT_EVENTS_LIMIT)?;
+                    if app.show_help {
+                        match key.code {
+                            KeyCode::Char('h') | KeyCode::Esc => app.toggle_help(),
+                            KeyCode::Char('q') => break,
+                            _ => {}
+                        }
+                        continue;
                     }
-                    KeyCode::Backspace => {
-                        app.search_input.pop();
-                        app.apply_filter();
+                    if app.search_mode {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.clear_search()?;
+                            }
+                            KeyCode::Enter => {
+                                app.search_mode = false;
+                                app.apply_filter();
+                                app.refresh_events()?;
+                            }
+                            KeyCode::Backspace => {
+                                app.search_input.pop();
+                                app.apply_filter();
+                            }
+                            KeyCode::Char(c) => {
+                                app.search_input.push(c);
+                                app.apply_filter();
+                            }
+                            _ => {}
+                        }
+                        continue;
                     }
-                    KeyCode::Char(c) => {
-                        app.search_input.push(c);
-                        app.apply_filter();
+                    match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Char('r') => app.reload(true)?,
+                        KeyCode::Esc => {
+                            if app.chart_fullscreen {
+                                app.chart_fullscreen = false;
+                            } else if !app.search_input.is_empty() {
+                                app.clear_search()?;
+                            }
+                        }
+                        KeyCode::Char('/') => {
+                            app.search_mode = true;
+                            app.status = "search mode".to_string();
+                        }
+                        KeyCode::Char('g') => app.jump_to_top()?,
+                        KeyCode::Char('G') => app.jump_to_bottom()?,
+                        KeyCode::Char('[') => app.page_by(-1)?,
+                        KeyCode::Char(']') => app.page_by(1)?,
+                        KeyCode::Char('o') => app.toggle_chart_fullscreen(),
+                        KeyCode::Char('h') => app.toggle_help(),
+                        KeyCode::Tab => app.cycle_focus(),
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            match app.focus {
+                                Focus::Table => {
+                                    app.move_selection(1)?;
+                                    app.ensure_selection_visible();
+                                }
+                                Focus::Events => app.scroll_events(1),
+                                Focus::Chart => {}
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            match app.focus {
+                                Focus::Table => {
+                                    app.move_selection(-1)?;
+                                    app.ensure_selection_visible();
+                                }
+                                Focus::Events => app.scroll_events(-1),
+                                Focus::Chart => {}
+                            }
+                        }
+                        KeyCode::Enter => {
+                            app.refresh_events()?;
+                        }
+                        KeyCode::Char(' ') => app.toggle_compare()?,
+                        _ => {}
                     }
-                    _ => {}
                 }
-                continue;
-            }
-            match key.code {
-                KeyCode::Char('q') => break,
-                KeyCode::Char('r') => app.reload(true)?,
-                KeyCode::Esc => {
-                    if !app.search_input.is_empty() {
-                        app.search_input.clear();
-                        app.apply_filter();
-                        app.events =
-                            recent_events(&app.conn, app.selected_team.as_deref(), RECENT_EVENTS_LIMIT)?;
-                    }
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse)?;
                 }
-                KeyCode::Char('/') => {
-                    app.search_mode = true;
-                    app.status = "search mode".to_string();
-                }
-                KeyCode::Tab => app.cycle_focus(),
-                KeyCode::Down | KeyCode::Char('j') => app.move_selection(1)?,
-                KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1)?,
-                KeyCode::Enter => {
-                    app.events =
-                        recent_events(&app.conn, app.selected_team.as_deref(), RECENT_EVENTS_LIMIT)?;
-                }
-                KeyCode::Char(' ') => app.toggle_compare()?,
                 _ => {}
             }
         }
@@ -268,25 +524,28 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
 }
 
 fn render(frame: &mut Frame<'_>, app: &App) {
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(37), Constraint::Length(3)])
-        .split(frame.area());
-    let bottom = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(layout[1]);
-
-    render_table(frame, layout[0], app);
-    render_events(frame, bottom[0], app);
-    render_chart(frame, bottom[1], app);
-    render_status(frame, layout[2], app);
+    let layout = split_layout(frame.area(), app.chart_fullscreen);
+    render_table(frame, layout.table, app);
+    render_events(frame, layout.events, app);
+    render_chart(frame, layout.chart, app);
+    render_status(frame, layout.status, app);
+    if app.show_help {
+        render_help(frame, frame.area(), app.chart_fullscreen);
+    }
 }
 
 fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let start = app.table_scroll.min(app.filtered_indices.len().saturating_sub(1));
+    let visible_rows = table_visible_rows(area);
+    let end = min(start + visible_rows, app.filtered_indices.len());
     let rows: Vec<Row<'_>> = app
         .filtered_indices
         .iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
         .filter_map(|idx| app.leaderboard.get(*idx))
         .map(|row| {
             let delta = if row.is_new {
@@ -342,18 +601,30 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
     )
     .row_highlight_style(Style::default().bg(Color::DarkGray))
     .highlight_symbol(">> ");
-    frame.render_stateful_widget(table, area, &mut app.table_state.clone());
+    let mut state = app.table_state.clone();
+    state.select(
+        app.table_state
+            .selected()
+            .and_then(|selected| selected.checked_sub(start))
+            .filter(|selected| *selected < end.saturating_sub(start)),
+    );
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 fn render_events(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let title = match &app.selected_team {
         Some(team_id) => format!("Events {}", team_id),
         None => "Recent Events".to_string(),
     };
+    let visible_rows = events_visible_rows(area);
     let items: Vec<ListItem<'_>> = app
         .events
         .iter()
-        .take(RECENT_EVENTS_LIMIT)
+        .skip(app.event_scroll)
+        .take(visible_rows)
         .map(|event| ListItem::new(Line::from(format_event(event))))
         .collect();
     let list = List::new(items).block(
@@ -366,6 +637,9 @@ fn render_events(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let title = if app.compare_teams.is_empty() {
         "Score Chart (press Space to add teams)"
     } else {
@@ -453,15 +727,134 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .selected_team
         .as_deref()
         .unwrap_or("-");
+    let hints = if app.search_mode {
+        "/ search  Esc clear  Enter apply  q quit"
+    } else if app.show_help {
+        "h/Esc close help  q quit"
+    } else {
+        "q quit  / search  h help  o chart  [ ] page  g/G jump"
+    };
     let help = format!(
-        "selected={} focus={:?} search=\"{}\" | / search | Space compare | Enter team events | Tab focus | r reload | q quit | {}",
-        selected,
-        app.focus,
-        app.search_input,
-        app.status
+        "{} | selected={} focus={:?} | {}",
+        hints, selected, app.focus, app.status
     );
     let paragraph = Paragraph::new(help).block(Block::default().borders(Borders::ALL).title("Status"));
     frame.render_widget(paragraph, area);
+}
+
+fn render_help(frame: &mut Frame<'_>, area: Rect, chart_fullscreen: bool) {
+    let popup = centered_rect(
+        if chart_fullscreen { 90 } else { 72 },
+        if chart_fullscreen { 55 } else { 60 },
+        area,
+    );
+    let text = vec![
+        Line::from("Navigation"),
+        Line::from("j/k or Up/Down: move in focused panel"),
+        Line::from("[ / ]: page up / page down in table or events"),
+        Line::from("g / G: jump to top / bottom in table or events"),
+        Line::from("Tab: cycle focus"),
+        Line::from(""),
+        Line::from("Views"),
+        Line::from("Space: add/remove selected team from chart compare"),
+        Line::from("o: toggle chart fullscreen"),
+        Line::from("/: start search"),
+        Line::from("Esc: clear search or exit chart fullscreen"),
+        Line::from(""),
+        Line::from("Mouse"),
+        Line::from("Single click row: select team"),
+        Line::from("Double click row: toggle compare team"),
+        Line::from("Wheel: scroll table or events"),
+        Line::from(""),
+        Line::from("General"),
+        Line::from("r: reload from sqlite"),
+        Line::from("h or Esc: close help"),
+        Line::from("q: quit"),
+    ];
+    let paragraph = Paragraph::new(text).block(
+        Block::default()
+            .title("Key Help")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    frame.render_widget(paragraph, popup);
+}
+
+fn current_view_layout(chart_fullscreen: bool) -> Result<ViewLayout> {
+    let (width, height) = size()?;
+    Ok(split_layout(Rect::new(0, 0, width, height), chart_fullscreen))
+}
+
+fn split_layout(area: Rect, chart_fullscreen: bool) -> ViewLayout {
+    if chart_fullscreen {
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(area);
+        return ViewLayout {
+            table: Rect::new(0, 0, 0, 0),
+            events: Rect::new(0, 0, 0, 0),
+            chart: layout[0],
+            status: layout[1],
+        };
+    }
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(37), Constraint::Length(3)])
+        .split(area);
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(layout[1]);
+    ViewLayout {
+        table: layout[0],
+        events: bottom[0],
+        chart: bottom[1],
+        status: layout[2],
+    }
+}
+
+fn contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+fn table_visible_rows(area: Rect) -> usize {
+    area.height.saturating_sub(3) as usize
+}
+
+fn events_visible_rows(area: Rect) -> usize {
+    area.height.saturating_sub(2) as usize
+}
+
+fn table_index_from_mouse(area: Rect, row: u16, scroll: usize) -> Option<usize> {
+    let data_start = area.y.saturating_add(2);
+    if row < data_start || row >= area.y.saturating_add(area.height.saturating_sub(1)) {
+        return None;
+    }
+    Some(scroll + (row - data_start) as usize)
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
 }
 
 fn border_style(active: bool) -> Style {

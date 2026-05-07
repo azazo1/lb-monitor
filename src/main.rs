@@ -13,9 +13,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, DummyArgs};
 use crate::config::LoadedConfig;
-use crate::db::{insert_snapshot, open_rw, previous_snapshot_rows};
+use crate::db::{insert_snapshot, open_rw, previous_snapshot_rows, replace_with_dummy_data};
 use crate::diff::diff_rows;
 use crate::fetch::fetch_leaderboard;
 use crate::notify::{NoopNotifier, Notifier, SystemNotifier};
@@ -27,6 +27,7 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Tui(Default::default())) {
         Command::Tui(_) => tui::run(&loaded.config),
         Command::Serve(args) => serve(&loaded.config, args.once),
+        Command::Dummy(args) => dummy(&loaded.config, &args),
     }
 }
 
@@ -75,4 +76,16 @@ fn run_fetch_cycle(
     }
 
     Ok(true)
+}
+
+fn dummy(config: &config::Config, args: &DummyArgs) -> Result<()> {
+    let mut conn = open_rw(&config.database.path)?;
+    replace_with_dummy_data(&mut conn, args.snapshots, args.teams)?;
+    println!(
+        "generated dummy database at {} with {} snapshots and {} teams",
+        config.database.path.display(),
+        args.snapshots.max(1),
+        args.teams.max(3)
+    );
+    Ok(())
 }

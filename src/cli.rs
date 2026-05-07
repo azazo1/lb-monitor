@@ -17,6 +17,7 @@ pub struct Cli {
 pub enum Command {
     Tui(TuiArgs),
     Serve(ServeArgs),
+    Dummy(DummyArgs),
 }
 
 #[derive(Debug, Clone, Args, Default)]
@@ -35,4 +36,12 @@ pub struct ServeArgs {
     pub notify: bool,
     #[arg(long, default_value_t = false, conflicts_with = "notify")]
     pub no_notify: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DummyArgs {
+    #[arg(long, default_value_t = 24)]
+    pub snapshots: usize,
+    #[arg(long, default_value_t = 18)]
+    pub teams: usize,
 }

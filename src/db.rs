@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use chrono::Utc;
+use chrono::{Duration, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::diff::{DiffResult, PreviousEntry};
+use crate::diff::diff_rows;
 use crate::parse::LeaderboardRow;
 
 #[derive(Debug, Clone)]
@@ -159,19 +160,29 @@ pub fn insert_snapshot(
     diff: &DiffResult,
 ) -> Result<String> {
     let now = Utc::now().to_rfc3339();
+    insert_snapshot_at(conn, source_updated_at, rows, diff, &now)
+}
+
+fn insert_snapshot_at(
+    conn: &mut Connection,
+    source_updated_at: Option<&str>,
+    rows: &[LeaderboardRow],
+    diff: &DiffResult,
+    fetched_at: &str,
+) -> Result<String> {
     let transaction = conn.transaction().context("failed to start transaction")?;
     transaction.execute(
         r#"
 INSERT INTO snapshots (fetched_at, source_updated_at, content_hash, row_count)
 VALUES (?1, ?2, ?3, ?4)
 "#,
-        params![now, source_updated_at, diff.content_hash, rows.len() as i64],
+        params![fetched_at, source_updated_at, diff.content_hash, rows.len() as i64],
     )?;
     let snapshot_id = transaction.last_insert_rowid();
 
     let mut team_ids = HashMap::new();
     for row in rows {
-        let team_id = upsert_team(&transaction, &row.team_id, &now)?;
+        let team_id = upsert_team(&transaction, &row.team_id, fetched_at)?;
         team_ids.insert(row.team_id.clone(), team_id);
         transaction.execute(
             r#"
@@ -183,7 +194,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, 1)
     }
 
     for dropped in &diff.dropped_team_ids {
-        let team_id = upsert_team(&transaction, dropped, &now)?;
+        let team_id = upsert_team(&transaction, dropped, fetched_at)?;
         transaction.execute(
             r#"
 INSERT INTO snapshot_entries (snapshot_id, team_id, rank, score, version, present)
@@ -197,7 +208,7 @@ VALUES (?1, ?2, NULL, NULL, NULL, 0)
         let team_id = if let Some(team_id) = team_ids.get(&event.team_id) {
             *team_id
         } else {
-            upsert_team(&transaction, &event.team_id, &now)?
+            upsert_team(&transaction, &event.team_id, fetched_at)?
         };
         transaction.execute(
             r#"
@@ -220,7 +231,7 @@ INSERT INTO team_events (
     }
 
     transaction.commit().context("failed to commit transaction")?;
-    Ok(now)
+    Ok(fetched_at.to_string())
 }
 
 fn upsert_team(conn: &Connection, team_id: &str, timestamp: &str) -> Result<i64> {
@@ -403,6 +414,113 @@ pub fn assert_has_snapshots(conn: &Connection) -> Result<()> {
     }
 }
 
+pub fn replace_with_dummy_data(
+    conn: &mut Connection,
+    snapshots: usize,
+    teams: usize,
+) -> Result<()> {
+    let snapshots = snapshots.max(1);
+    let teams = teams.max(3);
+    conn.execute_batch(
+        r#"
+DELETE FROM team_events;
+DELETE FROM snapshot_entries;
+DELETE FROM snapshots;
+DELETE FROM teams;
+"#,
+    )
+    .context("failed to clear existing sqlite data before dummy generation")?;
+
+    let mut previous = HashMap::new();
+    let start = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("valid dummy seed time");
+
+    for snapshot_idx in 0..snapshots {
+        let fetched_at = start + Duration::hours((snapshot_idx as i64) * 6);
+        let source_updated_at = fetched_at.format("%Y-%m-%d").to_string();
+        let rows = build_dummy_rows(snapshot_idx, teams);
+        let diff = diff_rows(&previous, &rows, Some(&source_updated_at));
+        insert_snapshot_at(
+            conn,
+            Some(&source_updated_at),
+            &rows,
+            &diff,
+            &fetched_at.to_rfc3339(),
+        )?;
+        previous = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.team_id.clone(),
+                    PreviousEntry {
+                        rank: Some(row.rank),
+                        score: Some(row.score),
+                        version: Some(row.version.clone()),
+                        present: true,
+                    },
+                )
+            })
+            .collect();
+    }
+
+    Ok(())
+}
+
+fn build_dummy_rows(snapshot_idx: usize, teams: usize) -> Vec<LeaderboardRow> {
+    let active_count = (8 + snapshot_idx * 2).min(teams);
+    let mut scored = Vec::new();
+
+    for team_idx in 0..active_count {
+        if active_count > 10
+            && snapshot_idx > 4
+            && snapshot_idx.is_multiple_of(5)
+            && team_idx + 1 == active_count
+        {
+            continue;
+        }
+
+        let team_number = team_idx + 1;
+        let team_id = format!("dummy-{team_number:04}");
+        let tier = (teams.saturating_sub(team_idx)) as f64 / teams as f64;
+        let trend = match team_idx % 4 {
+            0 => snapshot_idx as f64 * 0.0022,
+            1 => -(snapshot_idx as f64) * 0.0014,
+            2 => snapshot_idx as f64 * 0.0011,
+            _ => -(snapshot_idx as f64) * 0.0004,
+        };
+        let wave = (((snapshot_idx * (team_idx + 3)) % 11) as f64 - 5.0) / 900.0;
+        let rivalry = if team_idx % 6 == 0 {
+            snapshot_idx as f64 * 0.0009
+        } else {
+            0.0
+        };
+        let score = (0.12 + tier * 0.68 + trend + wave + rivalry).max(0.0);
+        let version = format!("v{}", 1 + ((snapshot_idx + team_idx) / 4));
+        scored.push((team_id, score, version));
+    }
+
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    scored
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (team_id, score, version))| LeaderboardRow {
+            rank: (idx + 1) as i64,
+            team_id,
+            score: (score * 10_000.0).round() / 10_000.0,
+            version,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -433,5 +551,25 @@ mod tests {
         let events = recent_events(&conn, Some("alpha"), 10).expect("query events");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, EventType::NewTeam.as_str());
+    }
+
+    #[test]
+    fn generates_dummy_database() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("dummy.sqlite3");
+        let mut conn = open_rw(&db_path).expect("open db");
+
+        replace_with_dummy_data(&mut conn, 6, 12).expect("generate dummy data");
+
+        let snapshot_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
+            .expect("count snapshots");
+        let team_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM teams", [], |row| row.get(0))
+            .expect("count teams");
+
+        assert_eq!(snapshot_count, 6);
+        assert!(team_count >= 8);
+        assert!(!latest_leaderboard(&conn).expect("leaderboard").is_empty());
     }
 }

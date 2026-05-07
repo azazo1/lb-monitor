@@ -8,6 +8,7 @@ use crate::cli::{Cli, Command, ServeArgs};
 
 const DEFAULT_CONFIG_PATH: &str = "lb-monitor.toml";
 const DEFAULT_DB_PATH: &str = "lb-monitor.sqlite3";
+const DEFAULT_DUMMY_DB_PATH: &str = "lb-monitor-dummy.sqlite3";
 const DEFAULT_URL: &str = "https://dataagent.top/leaderboard";
 const DEFAULT_INTERVAL_SECONDS: u64 = 300;
 const DEFAULT_TUI_REFRESH_SECONDS: u64 = 5;
@@ -128,6 +129,8 @@ impl LoadedConfig {
 
         if let Some(db_path) = &cli.db {
             config.database.path = db_path.clone();
+        } else if matches!(cli.command, Some(Command::Dummy(_))) {
+            config.database.path = PathBuf::from(DEFAULT_DUMMY_DB_PATH);
         }
 
         match &cli.command {
@@ -137,6 +140,7 @@ impl LoadedConfig {
                 }
             }
             Some(Command::Serve(args)) => apply_serve_overrides(&mut config, args),
+            Some(Command::Dummy(_)) => {}
             None => {}
         }
 
@@ -223,5 +227,15 @@ refresh_seconds = 9
         assert_eq!(loaded.config.fetch.interval_seconds, 60);
         assert!(loaded.config.notify.enabled);
         assert_eq!(loaded.config.tui.refresh_seconds, 9);
+    }
+
+    #[test]
+    fn dummy_uses_separate_default_db_when_no_config() {
+        let cli = Cli::parse_from(["lb-monitor", "dummy"]);
+        let loaded = LoadedConfig::load(&cli).expect("load config");
+        assert_eq!(
+            loaded.config.database.path,
+            PathBuf::from(DEFAULT_DUMMY_DB_PATH)
+        );
     }
 }
