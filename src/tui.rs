@@ -290,10 +290,10 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Row::new(vec![
                 Cell::from(marker.to_string()),
                 Cell::from(row.rank.to_string()),
-                Cell::from(delta),
+                Cell::from(delta).style(rank_delta_style(row.is_new, row.rank_delta)),
                 Cell::from(row.team_id.clone()),
                 Cell::from(format!("{:.4}", row.score)),
-                Cell::from(score_delta),
+                Cell::from(score_delta).style(score_delta_style(row.score_delta)),
                 Cell::from(row.version.clone()),
                 Cell::from(format_timestamp(&row.fetched_at)),
             ])
@@ -469,6 +469,18 @@ fn format_rank_delta(delta: Option<i64>) -> String {
     }
 }
 
+fn rank_delta_style(is_new: bool, delta: Option<i64>) -> Style {
+    if is_new {
+        return Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    }
+
+    match delta {
+        Some(value) if value > 0 => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Some(value) if value < 0 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(Color::DarkGray),
+    }
+}
+
 fn format_score_delta(delta: f64) -> String {
     if delta > 0.0 {
         format!("+{delta:.4}")
@@ -476,6 +488,14 @@ fn format_score_delta(delta: f64) -> String {
         format!("{delta:.4}")
     } else {
         "-".to_string()
+    }
+}
+
+fn score_delta_style(delta: Option<f64>) -> Style {
+    match delta {
+        Some(value) if value > 0.0 => Style::default().fg(Color::Green),
+        Some(value) if value < 0.0 => Style::default().fg(Color::Red),
+        _ => Style::default().fg(Color::DarkGray),
     }
 }
 

@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 
-use crate::parse::{LeaderboardPage, parse_leaderboard};
+use crate::parse::{LeaderboardPage, extract_bundle_path, parse_leaderboard, parse_leaderboard_bundle};
 
 pub fn fetch_leaderboard(url: &str) -> Result<LeaderboardPage> {
     let client = Client::builder()
@@ -17,5 +17,27 @@ pub fn fetch_leaderboard(url: &str) -> Result<LeaderboardPage> {
         .and_then(|response| response.error_for_status())
         .with_context(|| format!("failed to fetch leaderboard from {url}"))?;
     let html = response.text().context("failed to read leaderboard body")?;
-    parse_leaderboard(&html)
+    if let Ok(parsed) = parse_leaderboard(&html) {
+        return Ok(parsed);
+    }
+
+    let bundle_path = extract_bundle_path(&html).context("failed to locate leaderboard bundle")?;
+    let bundle_url = if bundle_path.starts_with("http://") || bundle_path.starts_with("https://") {
+        bundle_path
+    } else {
+        let base = reqwest::Url::parse(url).context("invalid leaderboard url")?;
+        base.join(&bundle_path)
+            .context("failed to resolve leaderboard bundle url")?
+            .to_string()
+    };
+
+    let bundle = client
+        .get(&bundle_url)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .with_context(|| format!("failed to fetch leaderboard bundle from {bundle_url}"))?
+        .text()
+        .context("failed to read leaderboard bundle body")?;
+
+    parse_leaderboard_bundle(&bundle)
 }
