@@ -267,6 +267,10 @@ impl App {
             self.compare_teams.remove(&team_id);
         }
         self.reload_chart_series()?;
+        if !self.filtered_indices.is_empty() {
+            self.move_selection(1)?;
+            self.ensure_selection_visible();
+        }
         Ok(())
     }
 
@@ -701,6 +705,7 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ];
     let y_start = if min_y.is_finite() { min_y.floor() } else { 0.0 };
     let y_end = if max_y.is_finite() { max_y.ceil() } else { 1.0 };
+    let y_mid = y_start + (y_end.max(y_start + 1.0) - y_start) / 2.0;
     let chart = Chart::new(datasets)
         .block(
             Block::default()
@@ -717,7 +722,14 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .y_axis(
             Axis::default()
                 .title("Score")
-                .bounds([y_start, y_end.max(y_start + 1.0)]),
+                .bounds([y_start, y_end.max(y_start + 1.0)])
+                .labels(
+                    vec![
+                        Line::from(format!("{y_start:.3}")),
+                        Line::from(format!("{y_mid:.3}")),
+                        Line::from(format!("{:.3}", y_end.max(y_start + 1.0))),
+                    ],
+                ),
         );
     frame.render_widget(chart, area);
 }
