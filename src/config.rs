@@ -582,7 +582,8 @@ database_path = "tui.sqlite3"
             .redacted_command_summary(cli.command.as_ref().expect("command"));
 
         assert!(summary.contains("interval_seconds: 300"));
-        assert!(summary.contains("listen: \"127.0.0.1:8080\""));
+        assert!(summary.contains("listen:"));
+        assert!(summary.contains(&loaded.config.serve.http.listen));
         assert!(summary.contains("smtp_port: 465"));
         assert!(summary.contains("smtp_security: Tls"));
         assert!(!summary.contains("interval: None"));

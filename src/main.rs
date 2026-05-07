@@ -10,10 +10,13 @@ mod query;
 mod source;
 mod tui;
 
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tokio::task;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -24,7 +27,8 @@ use crate::diff::diff_rows;
 use crate::fetch::fetch_leaderboard;
 use crate::notify::{MailNotifier, NoopNotifier, Notifier};
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let resolved_command = cli
@@ -37,45 +41,89 @@ fn main() -> Result<()> {
     info!(command = %command_summary, "starting lb-monitor");
     match resolved_command {
         Command::Tui(_) => tui::run(&loaded.config),
-        Command::Serve(args) => serve(&loaded.config, args.once),
+        Command::Serve(args) => serve(&loaded.config, args.once).await,
         Command::Dummy(args) => dummy(&loaded.config, &args),
     }
 }
 
-fn serve(config: &config::Config, once: bool) -> Result<()> {
+async fn serve(config: &config::Config, once: bool) -> Result<()> {
     info!(once, "starting serve loop");
-    let notifier: Box<dyn Notifier> = if config.serve.mail.enabled {
-        Box::new(MailNotifier::new(&config.serve.mail)?)
+    let notifier: Arc<dyn Notifier> = if config.serve.mail.enabled {
+        Arc::new(MailNotifier::new(&config.serve.mail)?)
     } else {
-        Box::new(NoopNotifier)
+        Arc::new(NoopNotifier)
     };
-
-    let mut conn = open_rw(&config.database.path)?;
+    let db_path = config.database.path.clone();
+    let fetch_url = config.serve.fetch.url.clone();
     if once {
-        run_fetch_cycle(&mut conn, config, notifier.as_ref())?;
+        run_fetch_cycle_async(db_path, fetch_url, notifier).await?;
         info!("completed single fetch cycle");
         return Ok(());
     }
 
-    let _api_thread =
-        api::spawn_http_server(config.database.path.clone(), &config.serve.http.listen)?;
+    let mut api_server =
+        api::spawn_http_server(config.database.path.clone(), &config.serve.http.listen).await?;
+    let interval = Duration::from_secs(config.serve.fetch.interval_seconds.max(1));
+
     loop {
-        if let Err(error) = run_fetch_cycle(&mut conn, config, notifier.as_ref()) {
-            error!(%error, "fetch cycle failed");
+        let mut fetch_cycle = task::spawn_blocking({
+            let db_path = db_path.clone();
+            let fetch_url = fetch_url.clone();
+            let notifier = Arc::clone(&notifier);
+            move || run_fetch_cycle(&db_path, &fetch_url, notifier.as_ref())
+        });
+
+        tokio::select! {
+            result = &mut fetch_cycle => {
+                log_fetch_cycle_result(result)?;
+            }
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed to install Ctrl-C handler")?;
+                info!("shutdown signal received, waiting for current fetch cycle to finish");
+                api_server.request_shutdown();
+                log_fetch_cycle_result(fetch_cycle.await)?;
+                api_server.join().await?;
+                info!("graceful shutdown completed");
+                return Ok(());
+            }
         }
-        std::thread::sleep(Duration::from_secs(
-            config.serve.fetch.interval_seconds.max(1),
-        ));
+
+        if api_server.is_finished() {
+            return api_server
+                .join()
+                .await
+                .context("api server exited unexpectedly");
+        }
+
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed to install Ctrl-C handler")?;
+                info!("shutdown signal received");
+                api_server.request_shutdown();
+                api_server.join().await?;
+                info!("graceful shutdown completed");
+                return Ok(());
+            }
+            _ = tokio::time::sleep(interval) => {}
+        }
+
+        if api_server.is_finished() {
+            return api_server
+                .join()
+                .await
+                .context("api server exited unexpectedly");
+        }
     }
 }
 
 fn run_fetch_cycle(
-    conn: &mut rusqlite::Connection,
-    config: &config::Config,
+    db_path: &Path,
+    url: &str,
     notifier: &dyn Notifier,
 ) -> Result<bool> {
-    let page = fetch_leaderboard(&config.serve.fetch.url)?;
-    let previous = previous_snapshot_rows(conn)?;
+    let mut conn = open_rw(db_path)?;
+    let page = fetch_leaderboard(url)?;
+    let previous = previous_snapshot_rows(&conn)?;
     let diff = diff_rows(&previous, &page.rows, page.source_updated_at.as_deref());
 
     if !diff.changed {
@@ -83,7 +131,12 @@ fn run_fetch_cycle(
     }
 
     let is_initial_snapshot = previous.is_empty();
-    let fetched_at = insert_snapshot(conn, page.source_updated_at.as_deref(), &page.rows, &diff)
+    let fetched_at = insert_snapshot(
+        &mut conn,
+        page.source_updated_at.as_deref(),
+        &page.rows,
+        &diff,
+    )
         .context("failed to persist leaderboard snapshot")?;
     let (subject, body) = build_notification_message(
         is_initial_snapshot,
@@ -102,6 +155,28 @@ fn run_fetch_cycle(
     }
 
     Ok(true)
+}
+
+async fn run_fetch_cycle_async(
+    db_path: std::path::PathBuf,
+    fetch_url: String,
+    notifier: Arc<dyn Notifier>,
+) -> Result<bool> {
+    task::spawn_blocking(move || run_fetch_cycle(&db_path, &fetch_url, notifier.as_ref()))
+        .await
+        .context("fetch cycle task join failed")?
+}
+
+fn log_fetch_cycle_result(
+    result: std::result::Result<Result<bool>, task::JoinError>,
+) -> Result<()> {
+    match result.context("fetch cycle task join failed")? {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            error!(%error, "fetch cycle failed");
+            Ok(())
+        }
+    }
 }
 
 fn build_notification_message(

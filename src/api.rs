@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::thread;
-use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::runtime::Builder;
+use tokio::sync::oneshot;
+use tokio::task::{self, JoinHandle};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
@@ -86,25 +86,28 @@ struct ApiAppState {
     db_path: PathBuf,
 }
 
-pub fn spawn_http_server(db_path: PathBuf, listen: &str) -> Result<JoinHandle<()>> {
-    let listen = listen.to_string();
-    Ok(thread::spawn(move || {
-        let runtime = match Builder::new_multi_thread().enable_all().build() {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                eprintln!("failed to start api runtime: {error}");
-                return;
-            }
-        };
-        runtime.block_on(async move {
-            if let Err(error) = serve_http(db_path, &listen).await {
-                eprintln!("api server stopped: {error}");
-            }
-        });
-    }))
+pub struct ApiServerHandle {
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    task: JoinHandle<Result<()>>,
 }
 
-pub async fn serve_http(db_path: PathBuf, listen: &str) -> Result<()> {
+impl ApiServerHandle {
+    pub fn request_shutdown(&mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    pub async fn join(self) -> Result<()> {
+        self.task.await.context("api server task join failed")?
+    }
+}
+
+pub async fn spawn_http_server(db_path: PathBuf, listen: &str) -> Result<ApiServerHandle> {
     let state = ApiAppState { db_path };
     let app = Router::new()
         .route("/api/v1/state", get(get_state))
@@ -119,16 +122,30 @@ pub async fn serve_http(db_path: PathBuf, listen: &str) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind api listener at {listen}"))?;
     info!(listen = %listen, "api server listening");
-    axum::serve(listener, app)
-        .await
-        .context("api server stopped")
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .context("api server stopped")
+    });
+    Ok(ApiServerHandle {
+        shutdown_tx: Some(shutdown_tx),
+        task,
+    })
 }
 
 #[tracing::instrument(skip(state))]
 async fn get_state(State(state): State<ApiAppState>) -> Result<Json<ApiState>, ApiError> {
-    let snapshot = load_snapshot_meta(&state.db_path)?;
-    let leaderboard =
-        load_leaderboard_state(&state.db_path, SnapshotPolicy::AllowEmpty)?.leaderboard;
+    let db_path = state.db_path.clone();
+    let (snapshot, leaderboard) = run_query(move || {
+        let snapshot = load_snapshot_meta(&db_path)?;
+        let leaderboard = load_leaderboard_state(&db_path, SnapshotPolicy::AllowEmpty)?.leaderboard;
+        Ok((snapshot, leaderboard))
+    })
+    .await?;
     Ok(Json(ApiState {
         snapshot,
         leaderboard,
@@ -137,15 +154,22 @@ async fn get_state(State(state): State<ApiAppState>) -> Result<Json<ApiState>, A
 
 #[tracing::instrument(skip(state))]
 async fn get_snapshot(State(state): State<ApiAppState>) -> Result<Json<SnapshotMeta>, ApiError> {
-    Ok(Json(load_snapshot_meta(&state.db_path)?))
+    let db_path = state.db_path.clone();
+    Ok(Json(
+        run_query(move || load_snapshot_meta(&db_path)).await?,
+    ))
 }
 
 #[tracing::instrument(skip(state))]
 async fn get_leaderboard(
     State(state): State<ApiAppState>,
 ) -> Result<Json<Vec<LeaderboardViewRow>>, ApiError> {
+    let db_path = state.db_path.clone();
     Ok(Json(
-        load_leaderboard_state(&state.db_path, SnapshotPolicy::AllowEmpty)?.leaderboard,
+        run_query(move || {
+            Ok(load_leaderboard_state(&db_path, SnapshotPolicy::AllowEmpty)?.leaderboard)
+        })
+        .await?,
     ))
 }
 
@@ -155,12 +179,18 @@ async fn get_events(
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<EventViewRow>>, ApiError> {
     let limit = query.limit.unwrap_or(100);
-    Ok(Json(load_recent_events(
-        &state.db_path,
-        query.team.as_deref(),
-        limit,
-        SnapshotPolicy::AllowEmpty,
-    )?))
+    let db_path = state.db_path.clone();
+    Ok(Json(
+        run_query(move || {
+            load_recent_events(
+                &db_path,
+                query.team.as_deref(),
+                limit,
+                SnapshotPolicy::AllowEmpty,
+            )
+        })
+        .await?,
+    ))
 }
 
 #[tracing::instrument(skip(state))]
@@ -178,11 +208,11 @@ async fn get_chart(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    Ok(Json(load_chart_series(
-        &state.db_path,
-        &team_ids,
-        SnapshotPolicy::AllowEmpty,
-    )?))
+    let db_path = state.db_path.clone();
+    Ok(Json(
+        run_query(move || load_chart_series(&db_path, &team_ids, SnapshotPolicy::AllowEmpty))
+            .await?,
+    ))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -208,6 +238,17 @@ where
     }
 }
 
+async fn run_query<T, F>(job: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    task::spawn_blocking(job)
+        .await
+        .context("query task join failed")?
+        .map_err(ApiError::from)
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         error!(error = %self.0, "api request failed");
@@ -215,7 +256,6 @@ impl IntoResponse for ApiError {
         (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
     }
 }
-use axum::response::IntoResponse;
 
 #[cfg(test)]
 mod tests {
