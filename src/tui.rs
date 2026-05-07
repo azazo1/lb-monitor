@@ -1,6 +1,6 @@
 use std::cmp::{max, min};
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -29,10 +29,8 @@ use ratatui::{
 };
 
 use crate::config::Config;
-use crate::db::{
-    ChartPoint, EventViewRow, LeaderboardViewRow, assert_has_snapshots, latest_leaderboard,
-    latest_snapshot_id, open_ro, recent_events, team_chart_series,
-};
+use crate::db::{ChartPoint, EventViewRow, LeaderboardViewRow};
+use crate::source::{TuiDataSource, build_tui_data_source};
 
 const RECENT_EVENTS_LIMIT: usize = 100;
 const CHART_COLORS: [Color; 6] = [
@@ -45,20 +43,14 @@ const CHART_COLORS: [Color; 6] = [
 ];
 
 pub fn run(config: &Config) -> Result<()> {
-    let conn = open_ro(&config.database.path)?;
-    assert_has_snapshots(&conn)?;
+    let data_source = build_tui_data_source(config)?;
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let terminal = ratatui::init();
 
-    let result = run_app(
-        terminal,
-        conn,
-        config.database.path.clone(),
-        config.tui.refresh_seconds,
-    );
+    let result = run_app(terminal, data_source, config.tui.refresh_seconds);
     ratatui::restore();
     disable_raw_mode()?;
     execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
@@ -86,7 +78,7 @@ enum ChartMode {
 }
 
 struct App {
-    conn: rusqlite::Connection,
+    data_source: Arc<dyn TuiDataSource>,
     latest_snapshot_id: Option<i64>,
     leaderboard: Vec<LeaderboardViewRow>,
     filtered_indices: Vec<usize>,
@@ -186,11 +178,11 @@ struct ChartLoadResponse {
 }
 
 impl App {
-    fn new(conn: rusqlite::Connection, db_path: PathBuf, refresh_seconds: u64) -> Result<Self> {
-        let event_loader = spawn_event_loader(db_path.clone());
-        let chart_loader = spawn_chart_loader(db_path.clone());
+    fn new(data_source: Arc<dyn TuiDataSource>, refresh_seconds: u64) -> Result<Self> {
+        let event_loader = spawn_event_loader(Arc::clone(&data_source));
+        let chart_loader = spawn_chart_loader(Arc::clone(&data_source));
         let mut app = Self {
-            conn,
+            data_source,
             latest_snapshot_id: None,
             leaderboard: Vec::new(),
             filtered_indices: Vec::new(),
@@ -224,12 +216,13 @@ impl App {
     }
 
     fn reload(&mut self, force: bool) -> Result<()> {
-        let current_snapshot_id = latest_snapshot_id(&self.conn)?;
+        let state = self.data_source.load_state()?;
+        let current_snapshot_id = state.latest_snapshot_id;
         if !force && current_snapshot_id == self.latest_snapshot_id {
             return Ok(());
         }
         self.latest_snapshot_id = current_snapshot_id;
-        self.leaderboard = latest_leaderboard(&self.conn)?;
+        self.leaderboard = state.leaderboard;
         self.apply_filter();
         self.schedule_dependent_loads()?;
         self.last_refresh = Instant::now();
@@ -663,7 +656,9 @@ impl App {
     }
 }
 
-fn spawn_event_loader(db_path: PathBuf) -> LoaderState<EventLoadRequest, EventLoadResponse> {
+fn spawn_event_loader(
+    data_source: Arc<dyn TuiDataSource>,
+) -> LoaderState<EventLoadRequest, EventLoadResponse> {
     let (tx, rx_commands) = mpsc::channel::<LoaderCommand<EventLoadRequest>>();
     let (tx_results, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
@@ -676,14 +671,8 @@ fn spawn_event_loader(db_path: PathBuf) -> LoaderState<EventLoadRequest, EventLo
                             LoaderCommand::Shutdown => return,
                         }
                     }
-                    let result = open_ro(&db_path)
-                        .and_then(|conn| {
-                            recent_events(
-                                &conn,
-                                request.team_filter.as_deref(),
-                                RECENT_EVENTS_LIMIT,
-                            )
-                        })
+                    let result = data_source
+                        .load_events(request.team_filter.as_deref(), RECENT_EVENTS_LIMIT)
                         .map_err(|error| error.to_string());
                     if tx_results
                         .send(EventLoadResponse {
@@ -709,7 +698,9 @@ fn spawn_event_loader(db_path: PathBuf) -> LoaderState<EventLoadRequest, EventLo
     }
 }
 
-fn spawn_chart_loader(db_path: PathBuf) -> LoaderState<ChartLoadRequest, ChartLoadResponse> {
+fn spawn_chart_loader(
+    data_source: Arc<dyn TuiDataSource>,
+) -> LoaderState<ChartLoadRequest, ChartLoadResponse> {
     let (tx, rx_commands) = mpsc::channel::<LoaderCommand<ChartLoadRequest>>();
     let (tx_results, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
@@ -722,8 +713,8 @@ fn spawn_chart_loader(db_path: PathBuf) -> LoaderState<ChartLoadRequest, ChartLo
                             LoaderCommand::Shutdown => return,
                         }
                     }
-                    let result = open_ro(&db_path)
-                        .and_then(|conn| team_chart_series(&conn, &request.team_ids))
+                    let result = data_source
+                        .load_chart(&request.team_ids)
                         .map_err(|error| error.to_string());
                     if tx_results
                         .send(ChartLoadResponse {
@@ -751,11 +742,10 @@ fn spawn_chart_loader(db_path: PathBuf) -> LoaderState<ChartLoadRequest, ChartLo
 
 fn run_app(
     mut terminal: DefaultTerminal,
-    conn: rusqlite::Connection,
-    db_path: PathBuf,
+    data_source: Arc<dyn TuiDataSource>,
     refresh_seconds: u64,
 ) -> Result<()> {
-    let mut app = App::new(conn, db_path, refresh_seconds)?;
+    let mut app = App::new(data_source, refresh_seconds)?;
 
     loop {
         app.poll_async_updates();

@@ -4,20 +4,22 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::cli::{Cli, Command, ServeArgs};
+use crate::cli::{Cli, Command, ServeArgs, TuiArgs};
 
 const DEFAULT_CONFIG_PATH: &str = "lb-monitor.toml";
 const DEFAULT_DB_PATH: &str = "lb-monitor.sqlite3";
 const DEFAULT_DUMMY_DB_PATH: &str = "lb-monitor-dummy.sqlite3";
-const DEFAULT_URL: &str = "https://dataagent.top/leaderboard";
-const DEFAULT_INTERVAL_SECONDS: u64 = 300;
+const DEFAULT_FETCH_URL: &str = "https://dataagent.top/leaderboard";
+const DEFAULT_TUI_API_BASE_URL: &str = "http://127.0.0.1:8080";
+const DEFAULT_SERVE_LISTEN_ADDR: &str = "127.0.0.1:8080";
+const DEFAULT_FETCH_INTERVAL_SECONDS: u64 = 300;
 const DEFAULT_TUI_REFRESH_SECONDS: u64 = 5;
+const DEFAULT_SMTP_PORT: u16 = 587;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database: DatabaseConfig,
-    pub fetch: FetchConfig,
-    pub notify: NotifyConfig,
+    pub serve: ServeConfig,
     pub tui: TuiConfig,
 }
 
@@ -27,19 +29,59 @@ pub struct DatabaseConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct ServeConfig {
+    pub fetch: FetchConfig,
+    pub http: ServeHttpConfig,
+    pub mail: MailConfig,
+}
+
+#[derive(Debug, Clone)]
 pub struct FetchConfig {
     pub url: String,
     pub interval_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
-pub struct NotifyConfig {
+pub struct ServeHttpConfig {
+    pub listen: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MailConfig {
     pub enabled: bool,
+    pub smtp: SmtpConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct SmtpConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub from: Option<String>,
+    pub to: Vec<String>,
+    pub security: SmtpSecurity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmtpSecurity {
+    Plain,
+    StartTls,
+    Tls,
 }
 
 #[derive(Debug, Clone)]
 pub struct TuiConfig {
     pub refresh_seconds: u64,
+    pub api_base_url: String,
+    pub source: TuiSource,
+    pub database_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiSource {
+    LocalSqlite,
+    RemoteApi,
 }
 
 #[derive(Debug, Clone)]
@@ -50,8 +92,7 @@ pub struct LoadedConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
     database: Option<FileDatabaseConfig>,
-    fetch: Option<FileFetchConfig>,
-    notify: Option<FileNotifyConfig>,
+    serve: Option<FileServeConfig>,
     tui: Option<FileTuiConfig>,
 }
 
@@ -61,19 +102,46 @@ struct FileDatabaseConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct FileServeConfig {
+    fetch: Option<FileFetchConfig>,
+    http: Option<FileServeHttpConfig>,
+    mail: Option<FileMailConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct FileFetchConfig {
     url: Option<String>,
     interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct FileNotifyConfig {
+struct FileServeHttpConfig {
+    listen: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileMailConfig {
     enabled: Option<bool>,
+    smtp: Option<FileSmtpConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileSmtpConfig {
+    host: Option<String>,
+    port: Option<u16>,
+    username: Option<String>,
+    password: Option<String>,
+    from: Option<String>,
+    to: Option<Vec<String>>,
+    security: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct FileTuiConfig {
     refresh_seconds: Option<u64>,
+    api_base_url: Option<String>,
+    source: Option<String>,
+    database_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -82,13 +150,32 @@ impl Default for Config {
             database: DatabaseConfig {
                 path: PathBuf::from(DEFAULT_DB_PATH),
             },
-            fetch: FetchConfig {
-                url: DEFAULT_URL.to_string(),
-                interval_seconds: DEFAULT_INTERVAL_SECONDS,
+            serve: ServeConfig {
+                fetch: FetchConfig {
+                    url: DEFAULT_FETCH_URL.to_string(),
+                    interval_seconds: DEFAULT_FETCH_INTERVAL_SECONDS,
+                },
+                http: ServeHttpConfig {
+                    listen: DEFAULT_SERVE_LISTEN_ADDR.to_string(),
+                },
+                mail: MailConfig {
+                    enabled: false,
+                    smtp: SmtpConfig {
+                        host: String::new(),
+                        port: DEFAULT_SMTP_PORT,
+                        username: None,
+                        password: None,
+                        from: None,
+                        to: Vec::new(),
+                        security: SmtpSecurity::StartTls,
+                    },
+                },
             },
-            notify: NotifyConfig { enabled: true },
             tui: TuiConfig {
                 refresh_seconds: DEFAULT_TUI_REFRESH_SECONDS,
+                api_base_url: DEFAULT_TUI_API_BASE_URL.to_string(),
+                source: TuiSource::LocalSqlite,
+                database_path: PathBuf::from(DEFAULT_DB_PATH),
             },
         }
     }
@@ -102,61 +189,185 @@ impl LoadedConfig {
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
         let file_config = load_file_config(&config_path)?;
         let mut config = Config::default();
+        let mut tui_source_explicit = false;
+        let mut tui_database_path_explicit = false;
+        let mut tui_api_base_url_set = false;
 
         if let Some(database) = file_config.database
             && let Some(path) = database.path
         {
             config.database.path = path;
         }
-        if let Some(fetch) = file_config.fetch {
-            if let Some(url) = fetch.url {
-                config.fetch.url = url;
+
+        if let Some(serve) = file_config.serve {
+            if let Some(fetch) = serve.fetch {
+                apply_fetch_overrides(&mut config.serve.fetch, fetch);
             }
-            if let Some(interval_seconds) = fetch.interval_seconds {
-                config.fetch.interval_seconds = interval_seconds;
+            if let Some(http) = serve.http
+                && let Some(listen) = http.listen
+            {
+                config.serve.http.listen = listen;
+            }
+            if let Some(mail) = serve.mail {
+                apply_mail_overrides(&mut config.serve.mail, mail);
             }
         }
-        if let Some(notify) = file_config.notify
-            && let Some(enabled) = notify.enabled
-        {
-            config.notify.enabled = enabled;
+
+        if let Some(tui) = file_config.tui {
+            if let Some(refresh_seconds) = tui.refresh_seconds {
+                config.tui.refresh_seconds = refresh_seconds;
+            }
+            if let Some(api_base_url) = tui.api_base_url {
+                config.tui.api_base_url = api_base_url;
+                tui_api_base_url_set = true;
+            }
+            if let Some(source) = tui.source {
+                config.tui.source = parse_tui_source(&source).unwrap_or(TuiSource::LocalSqlite);
+                tui_source_explicit = true;
+            }
+            if let Some(database_path) = tui.database_path {
+                config.tui.database_path = database_path;
+                tui_database_path_explicit = true;
+            }
         }
-        if let Some(tui) = file_config.tui
-            && let Some(refresh_seconds) = tui.refresh_seconds
-        {
-            config.tui.refresh_seconds = refresh_seconds;
+
+        if tui_api_base_url_set && !tui_source_explicit {
+            config.tui.source = TuiSource::RemoteApi;
         }
 
         if let Some(db_path) = &cli.db {
             config.database.path = db_path.clone();
+            config.tui.database_path = db_path.clone();
         } else if matches!(cli.command, Some(Command::Dummy(_))) {
             config.database.path = PathBuf::from(DEFAULT_DUMMY_DB_PATH);
+            config.tui.database_path = config.database.path.clone();
+        } else if !tui_database_path_explicit {
+            config.tui.database_path = config.database.path.clone();
         }
 
         match &cli.command {
-            Some(Command::Tui(args)) => {
-                if let Some(refresh_seconds) = args.refresh_seconds {
-                    config.tui.refresh_seconds = refresh_seconds;
-                }
-            }
+            Some(Command::Tui(args)) => apply_tui_overrides(&mut config, args),
             Some(Command::Serve(args)) => apply_serve_overrides(&mut config, args),
             Some(Command::Dummy(_)) => {}
             None => {}
+        }
+
+        if config.tui.api_base_url.is_empty() {
+            config.tui.api_base_url = DEFAULT_TUI_API_BASE_URL.to_string();
         }
 
         Ok(Self { config })
     }
 }
 
+fn apply_fetch_overrides(target: &mut FetchConfig, source: FileFetchConfig) {
+    if let Some(url) = source.url {
+        target.url = url;
+    }
+    if let Some(interval_seconds) = source.interval_seconds {
+        target.interval_seconds = interval_seconds;
+    }
+}
+
+fn apply_mail_overrides(target: &mut MailConfig, source: FileMailConfig) {
+    if let Some(enabled) = source.enabled {
+        target.enabled = enabled;
+    }
+    if let Some(smtp) = source.smtp {
+        apply_smtp_overrides(&mut target.smtp, smtp);
+    }
+}
+
+fn apply_tui_overrides(config: &mut Config, args: &TuiArgs) {
+    if let Some(refresh_seconds) = args.refresh_seconds {
+        config.tui.refresh_seconds = refresh_seconds;
+    }
+    if let Some(source) = &args.source {
+        config.tui.source = parse_tui_source(source).unwrap_or(TuiSource::LocalSqlite);
+    }
+    if let Some(api_base_url) = &args.api_base_url {
+        config.tui.api_base_url = api_base_url.clone();
+        if args.source.is_none() {
+            config.tui.source = TuiSource::RemoteApi;
+        }
+    }
+}
+
 fn apply_serve_overrides(config: &mut Config, args: &ServeArgs) {
     if let Some(interval) = args.interval {
-        config.fetch.interval_seconds = interval;
+        config.serve.fetch.interval_seconds = interval;
+    }
+    if let Some(listen) = &args.listen {
+        config.serve.http.listen = listen.clone();
     }
     if args.notify {
-        config.notify.enabled = true;
+        config.serve.mail.enabled = true;
     }
     if args.no_notify {
-        config.notify.enabled = false;
+        config.serve.mail.enabled = false;
+    }
+    if let Some(host) = &args.smtp_host {
+        config.serve.mail.smtp.host = host.clone();
+    }
+    if let Some(port) = args.smtp_port {
+        config.serve.mail.smtp.port = port;
+    }
+    if let Some(username) = &args.smtp_username {
+        config.serve.mail.smtp.username = Some(username.clone());
+    }
+    if let Some(password) = &args.smtp_password {
+        config.serve.mail.smtp.password = Some(password.clone());
+    }
+    if let Some(from) = &args.smtp_from {
+        config.serve.mail.smtp.from = Some(from.clone());
+    }
+    if !args.smtp_to.is_empty() {
+        config.serve.mail.smtp.to = args.smtp_to.clone();
+    }
+    if let Some(security) = &args.smtp_security {
+        config.serve.mail.smtp.security =
+            parse_smtp_security(security).unwrap_or(SmtpSecurity::StartTls);
+    }
+}
+
+fn apply_smtp_overrides(target: &mut SmtpConfig, source: FileSmtpConfig) {
+    if let Some(host) = source.host {
+        target.host = host;
+    }
+    if let Some(port) = source.port {
+        target.port = port;
+    }
+    if let Some(username) = source.username {
+        target.username = Some(username);
+    }
+    if let Some(password) = source.password {
+        target.password = Some(password);
+    }
+    if let Some(from) = source.from {
+        target.from = Some(from);
+    }
+    if let Some(to) = source.to {
+        target.to = to;
+    }
+    if let Some(security) = source.security {
+        target.security = parse_smtp_security(&security).unwrap_or(SmtpSecurity::StartTls);
+    }
+}
+
+fn parse_smtp_security(value: &str) -> Option<SmtpSecurity> {
+    match value.to_ascii_lowercase().as_str() {
+        "plain" => Some(SmtpSecurity::Plain),
+        "starttls" => Some(SmtpSecurity::StartTls),
+        "tls" => Some(SmtpSecurity::Tls),
+        _ => None,
+    }
+}
+
+fn parse_tui_source(value: &str) -> Option<TuiSource> {
+    match value.to_ascii_lowercase().as_str() {
+        "sqlite" | "local" | "local-sqlite" => Some(TuiSource::LocalSqlite),
+        "http" | "https" | "remote" | "remote-api" => Some(TuiSource::RemoteApi),
+        _ => None,
     }
 }
 
@@ -173,81 +384,123 @@ fn load_file_config(path: &Path) -> Result<FileConfig> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
-    use clap::Parser;
+    use super::*;
+    use crate::cli::{Cli, Command, TuiArgs};
     use tempfile::tempdir;
 
-    use super::*;
-    use crate::cli::Cli;
-
     #[test]
-    fn uses_defaults_when_config_missing() {
-        let dir = tempdir().expect("tempdir");
-        let missing_config = dir.path().join("missing.toml");
-        let cli = Cli::parse_from([
-            "lb-monitor",
-            "--config",
-            missing_config.to_str().expect("utf8"),
-        ]);
+    fn tui_defaults_to_local_sqlite() {
+        let cli = Cli {
+            config: None,
+            db: None,
+            command: Some(Command::Tui(TuiArgs::default())),
+        };
         let loaded = LoadedConfig::load(&cli).expect("load config");
-        assert_eq!(
-            loaded.config.fetch.interval_seconds,
-            DEFAULT_INTERVAL_SECONDS
-        );
-        assert_eq!(loaded.config.database.path, PathBuf::from(DEFAULT_DB_PATH));
+        assert!(matches!(loaded.config.tui.source, TuiSource::LocalSqlite));
     }
 
     #[test]
-    fn merges_toml_and_cli_overrides() {
+    fn tui_switches_to_remote_when_api_base_url_is_set() {
+        let cli = Cli {
+            config: None,
+            db: None,
+            command: Some(Command::Tui(TuiArgs {
+                refresh_seconds: None,
+                source: None,
+                api_base_url: Some("https://example.com".to_string()),
+            })),
+        };
+        let loaded = LoadedConfig::load(&cli).expect("load config");
+        assert!(matches!(loaded.config.tui.source, TuiSource::RemoteApi));
+        assert_eq!(loaded.config.tui.api_base_url, "https://example.com");
+    }
+
+    #[test]
+    fn explicit_sqlite_source_keeps_local_reads() {
+        let cli = Cli {
+            config: None,
+            db: None,
+            command: Some(Command::Tui(TuiArgs {
+                refresh_seconds: None,
+                source: Some("sqlite".to_string()),
+                api_base_url: Some("https://example.com".to_string()),
+            })),
+        };
+        let loaded = LoadedConfig::load(&cli).expect("load config");
+        assert!(matches!(loaded.config.tui.source, TuiSource::LocalSqlite));
+        assert_eq!(loaded.config.tui.api_base_url, "https://example.com");
+    }
+
+    #[test]
+    fn loads_grouped_serve_and_tui_sections() {
         let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("lb-monitor.toml");
         fs::write(
             &config_path,
             r#"
 [database]
-path = "sample.sqlite3"
+path = "shared.sqlite3"
 
-[fetch]
-interval_seconds = 123
+[serve.fetch]
+url = "https://example.com/leaderboard"
+interval_seconds = 120
 
-[notify]
-enabled = false
+[serve.http]
+listen = "0.0.0.0:9000"
+
+[serve.mail]
+enabled = true
+
+[serve.mail.smtp]
+host = "smtp.example.com"
+port = 2525
+from = "sender@example.com"
+to = ["alpha@example.com", "beta@example.com"]
+security = "plain"
 
 [tui]
 refresh_seconds = 9
+source = "remote-api"
+api_base_url = "https://api.example.com"
+database_path = "tui.sqlite3"
 "#,
         )
         .expect("write config");
-        let cli = Cli::parse_from([
-            "lb-monitor",
-            "--config",
-            config_path.to_str().expect("utf8"),
-            "--db",
-            "override.sqlite3",
-            "serve",
-            "--interval",
-            "60",
-            "--notify",
-        ]);
 
+        let cli = Cli {
+            config: Some(config_path),
+            db: None,
+            command: Some(Command::Tui(TuiArgs::default())),
+        };
         let loaded = LoadedConfig::load(&cli).expect("load config");
+
+        assert_eq!(loaded.config.database.path, PathBuf::from("shared.sqlite3"));
         assert_eq!(
-            loaded.config.database.path,
-            PathBuf::from("override.sqlite3")
+            loaded.config.serve.fetch.url,
+            "https://example.com/leaderboard"
         );
-        assert_eq!(loaded.config.fetch.interval_seconds, 60);
-        assert!(loaded.config.notify.enabled);
-        assert_eq!(loaded.config.tui.refresh_seconds, 9);
-    }
-
-    #[test]
-    fn dummy_uses_separate_default_db_when_no_config() {
-        let cli = Cli::parse_from(["lb-monitor", "dummy"]);
-        let loaded = LoadedConfig::load(&cli).expect("load config");
+        assert_eq!(loaded.config.serve.fetch.interval_seconds, 120);
+        assert_eq!(loaded.config.serve.http.listen, "0.0.0.0:9000");
+        assert!(loaded.config.serve.mail.enabled);
+        assert_eq!(loaded.config.serve.mail.smtp.host, "smtp.example.com");
+        assert_eq!(loaded.config.serve.mail.smtp.port, 2525);
         assert_eq!(
-            loaded.config.database.path,
-            PathBuf::from(DEFAULT_DUMMY_DB_PATH)
+            loaded.config.serve.mail.smtp.to,
+            vec![
+                "alpha@example.com".to_string(),
+                "beta@example.com".to_string()
+            ]
+        );
+        assert!(matches!(
+            loaded.config.serve.mail.smtp.security,
+            SmtpSecurity::Plain
+        ));
+        assert_eq!(loaded.config.tui.refresh_seconds, 9);
+        assert!(matches!(loaded.config.tui.source, TuiSource::RemoteApi));
+        assert_eq!(loaded.config.tui.api_base_url, "https://api.example.com");
+        assert_eq!(
+            loaded.config.tui.database_path,
+            PathBuf::from("tui.sqlite3")
         );
     }
 }

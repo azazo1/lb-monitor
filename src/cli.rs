@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "lb-monitor",
     version,
-    about = "Leaderboard monitor with SQLite-backed TUI"
+    about = "Leaderboard monitor with SQLite-backed storage and HTTP API"
 )]
 pub struct Cli {
     #[arg(long, global = true)]
@@ -28,6 +28,10 @@ pub enum Command {
 pub struct TuiArgs {
     #[arg(long)]
     pub refresh_seconds: Option<u64>,
+    #[arg(long)]
+    pub source: Option<String>,
+    #[arg(long)]
+    pub api_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -35,11 +39,27 @@ pub struct ServeArgs {
     #[arg(long)]
     pub interval: Option<u64>,
     #[arg(long)]
+    pub listen: Option<String>,
+    #[arg(long)]
     pub once: bool,
     #[arg(long, default_value_t = false, conflicts_with = "no_notify")]
     pub notify: bool,
     #[arg(long, default_value_t = false, conflicts_with = "notify")]
     pub no_notify: bool,
+    #[arg(long)]
+    pub smtp_host: Option<String>,
+    #[arg(long)]
+    pub smtp_port: Option<u16>,
+    #[arg(long)]
+    pub smtp_username: Option<String>,
+    #[arg(long)]
+    pub smtp_password: Option<String>,
+    #[arg(long)]
+    pub smtp_from: Option<String>,
+    #[arg(long, value_delimiter = ',')]
+    pub smtp_to: Vec<String>,
+    #[arg(long)]
+    pub smtp_security: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]

@@ -1,3 +1,4 @@
+mod api;
 mod cli;
 mod config;
 mod db;
@@ -5,9 +6,10 @@ mod diff;
 mod fetch;
 mod notify;
 mod parse;
+mod query;
+mod source;
 mod tui;
 
-use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -18,7 +20,7 @@ use crate::config::LoadedConfig;
 use crate::db::{insert_snapshot, open_rw, previous_snapshot_rows, replace_with_dummy_data};
 use crate::diff::diff_rows;
 use crate::fetch::fetch_leaderboard;
-use crate::notify::{NoopNotifier, Notifier, SystemNotifier};
+use crate::notify::{MailNotifier, NoopNotifier, Notifier};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -32,21 +34,26 @@ fn main() -> Result<()> {
 }
 
 fn serve(config: &config::Config, once: bool) -> Result<()> {
-    let notifier: Box<dyn Notifier> = if config.notify.enabled {
-        Box::new(SystemNotifier)
+    let notifier: Box<dyn Notifier> = if config.serve.mail.enabled {
+        Box::new(MailNotifier::new(&config.serve.mail)?)
     } else {
         Box::new(NoopNotifier)
     };
 
     let mut conn = open_rw(&config.database.path)?;
+    if once {
+        run_fetch_cycle(&mut conn, config, notifier.as_ref())?;
+        return Ok(());
+    }
+
+    let _api_thread =
+        api::spawn_http_server(config.database.path.clone(), &config.serve.http.listen)?;
     loop {
         run_fetch_cycle(&mut conn, config, notifier.as_ref())?;
-        if once {
-            break;
-        }
-        thread::sleep(Duration::from_secs(config.fetch.interval_seconds.max(1)));
+        std::thread::sleep(Duration::from_secs(
+            config.serve.fetch.interval_seconds.max(1),
+        ));
     }
-    Ok(())
 }
 
 fn run_fetch_cycle(
@@ -54,7 +61,7 @@ fn run_fetch_cycle(
     config: &config::Config,
     notifier: &dyn Notifier,
 ) -> Result<bool> {
-    let page = fetch_leaderboard(&config.fetch.url)?;
+    let page = fetch_leaderboard(&config.serve.fetch.url)?;
     let previous = previous_snapshot_rows(conn)?;
     let diff = diff_rows(&previous, &page.rows, page.source_updated_at.as_deref());
 
@@ -67,15 +74,67 @@ fn run_fetch_cycle(
         .context("failed to persist leaderboard snapshot")?;
 
     if !is_initial_snapshot {
-        let body = format!(
-            "Detected {} team changes at {}",
-            diff.events.len(),
-            fetched_at
-        );
-        notifier.notify_update(&body)?;
+        let body = format_mail_body(&fetched_at, &diff.events);
+        let subject = format!("Leaderboard updated ({} changes)", diff.events.len());
+        notifier.notify_update(&subject, &body)?;
     }
 
     Ok(true)
+}
+
+fn format_mail_body(fetched_at: &str, events: &[crate::diff::TeamEvent]) -> String {
+    let mut lines = vec![
+        format!("Leaderboard updated at {fetched_at}"),
+        String::new(),
+    ];
+    for event in events {
+        let line = match event.event_type {
+            crate::diff::EventType::NewTeam => format!(
+                "+ {} rank={} score={:.4} version={}",
+                event.team_id,
+                event.new_rank.unwrap_or_default(),
+                event.new_score.unwrap_or_default(),
+                event.new_version.as_deref().unwrap_or("-")
+            ),
+            crate::diff::EventType::DroppedTeam => format!(
+                "- {} rank={} score={:.4} version={}",
+                event.team_id,
+                event.old_rank.unwrap_or_default(),
+                event.old_score.unwrap_or_default(),
+                event.old_version.as_deref().unwrap_or("-")
+            ),
+            crate::diff::EventType::RankChanged => format!(
+                "~ {} rank {} -> {}",
+                event.team_id,
+                event.old_rank.unwrap_or_default(),
+                event.new_rank.unwrap_or_default()
+            ),
+            crate::diff::EventType::ScoreChanged => format!(
+                "~ {} score {:.4} -> {:.4}",
+                event.team_id,
+                event.old_score.unwrap_or_default(),
+                event.new_score.unwrap_or_default()
+            ),
+            crate::diff::EventType::VersionChanged => format!(
+                "~ {} version {} -> {}",
+                event.team_id,
+                event.old_version.as_deref().unwrap_or("-"),
+                event.new_version.as_deref().unwrap_or("-")
+            ),
+            crate::diff::EventType::MultiChanged => format!(
+                "~ {} rank {:?} score {:?} version {:?} -> {:?} {:?} {:?}",
+                event.team_id,
+                event.old_rank,
+                event.old_score,
+                event.old_version,
+                event.new_rank,
+                event.new_score,
+                event.new_version
+            ),
+        };
+        lines.push(line);
+    }
+    lines.join("\n")
 }
 
 fn dummy(config: &config::Config, args: &DummyArgs) -> Result<()> {
@@ -88,4 +147,28 @@ fn dummy(config: &config::Config, args: &DummyArgs) -> Result<()> {
         args.teams.max(3)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff::{EventType, TeamEvent};
+
+    #[test]
+    fn formats_mail_summary() {
+        let events = vec![TeamEvent {
+            team_id: "alpha".to_string(),
+            event_type: EventType::NewTeam,
+            old_rank: None,
+            new_rank: Some(1),
+            old_score: None,
+            new_score: Some(100.0),
+            old_version: None,
+            new_version: Some("v1".to_string()),
+        }];
+
+        let body = format_mail_body("2026-05-07T00:00:00Z", &events);
+        assert!(body.contains("Leaderboard updated at"));
+        assert!(body.contains("+ alpha"));
+    }
 }

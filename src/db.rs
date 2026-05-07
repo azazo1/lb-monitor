@@ -4,12 +4,13 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use chrono::{Duration, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use crate::diff::diff_rows;
 use crate::diff::{DiffResult, PreviousEntry};
 use crate::parse::LeaderboardRow;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LeaderboardViewRow {
     pub team_id: String,
     pub rank: i64,
@@ -21,7 +22,7 @@ pub struct LeaderboardViewRow {
     pub is_new: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EventViewRow {
     pub fetched_at: String,
     pub team_id: String,
@@ -34,7 +35,7 @@ pub struct EventViewRow {
     pub new_version: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChartPoint {
     pub timestamp: i64,
     pub rank: i64,

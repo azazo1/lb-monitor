@@ -1,12 +1,27 @@
 [database]
 path = "lb-monitor.sqlite3"
 
-[fetch]
+[serve.fetch]
 url = "https://dataagent.top/leaderboard"
 interval_seconds = 300
 
-[notify]
-enabled = true
+[serve.http]
+listen = "127.0.0.1:8080"
+
+[serve.mail]
+enabled = false
+
+[serve.mail.smtp]
+host = "smtp.example.com"
+port = 587
+username = "user@example.com"
+password = "secret"
+from = "sender@example.com"
+to = ["alpha@example.com", "beta@example.com"]
+security = "starttls"
 
 [tui]
 refresh_seconds = 5
+source = "sqlite" # "remote-api"
+# database_path = "lb-monitor.sqlite3"
+# api_base_url = "https://example.com"
