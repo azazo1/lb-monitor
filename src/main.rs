@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tracing::{error, info};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::cli::{Cli, Command, DummyArgs};
 use crate::config::LoadedConfig;
@@ -23,9 +25,11 @@ use crate::fetch::fetch_leaderboard;
 use crate::notify::{MailNotifier, NoopNotifier, Notifier};
 
 fn main() -> Result<()> {
+    init_tracing();
     let cli = Cli::parse();
     let loaded = LoadedConfig::load(&cli)?;
 
+    info!(command = ?cli.command, "starting lb-monitor");
     match cli.command.unwrap_or(Command::Tui(Default::default())) {
         Command::Tui(_) => tui::run(&loaded.config),
         Command::Serve(args) => serve(&loaded.config, args.once),
@@ -34,6 +38,7 @@ fn main() -> Result<()> {
 }
 
 fn serve(config: &config::Config, once: bool) -> Result<()> {
+    info!(once, "starting serve loop");
     let notifier: Box<dyn Notifier> = if config.serve.mail.enabled {
         Box::new(MailNotifier::new(&config.serve.mail)?)
     } else {
@@ -43,13 +48,16 @@ fn serve(config: &config::Config, once: bool) -> Result<()> {
     let mut conn = open_rw(&config.database.path)?;
     if once {
         run_fetch_cycle(&mut conn, config, notifier.as_ref())?;
+        info!("completed single fetch cycle");
         return Ok(());
     }
 
     let _api_thread =
         api::spawn_http_server(config.database.path.clone(), &config.serve.http.listen)?;
     loop {
-        run_fetch_cycle(&mut conn, config, notifier.as_ref())?;
+        if let Err(error) = run_fetch_cycle(&mut conn, config, notifier.as_ref()) {
+            error!(%error, "fetch cycle failed");
+        }
         std::thread::sleep(Duration::from_secs(
             config.serve.fetch.interval_seconds.max(1),
         ));
@@ -77,6 +85,7 @@ fn run_fetch_cycle(
         let body = format_mail_body(&fetched_at, &diff.events);
         let subject = format!("Leaderboard updated ({} changes)", diff.events.len());
         notifier.notify_update(&subject, &body)?;
+        info!(changes = diff.events.len(), "leaderboard updated");
     }
 
     Ok(true)
@@ -140,6 +149,11 @@ fn format_mail_body(fetched_at: &str, events: &[crate::diff::TeamEvent]) -> Stri
 fn dummy(config: &config::Config, args: &DummyArgs) -> Result<()> {
     let mut conn = open_rw(&config.database.path)?;
     replace_with_dummy_data(&mut conn, args.snapshots, args.teams)?;
+    info!(
+        snapshots = args.snapshots,
+        teams = args.teams,
+        "generated dummy database"
+    );
     println!(
         "generated dummy database at {} with {} snapshots and {} teams",
         config.database.path.display(),
@@ -147,6 +161,16 @@ fn dummy(config: &config::Config, args: &DummyArgs) -> Result<()> {
         args.teams.max(3)
     );
     Ok(())
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("lb_monitor=info,axum=info,tower_http=info,reqwest=warn")
+    });
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_target(false).compact());
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
 #[cfg(test)]

@@ -11,6 +11,8 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
+use tower_http::trace::TraceLayer;
+use tracing::{error, info};
 
 use crate::db::{ChartPoint, EventViewRow, LeaderboardViewRow};
 use crate::query::{
@@ -110,16 +112,19 @@ pub async fn serve_http(db_path: PathBuf, listen: &str) -> Result<()> {
         .route("/api/v1/leaderboard", get(get_leaderboard))
         .route("/api/v1/events", get(get_events))
         .route("/api/v1/chart", get(get_chart))
+        .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let listener = TcpListener::bind(listen)
         .await
         .with_context(|| format!("failed to bind api listener at {listen}"))?;
+    info!(listen = %listen, "api server listening");
     axum::serve(listener, app)
         .await
         .context("api server stopped")
 }
 
+#[tracing::instrument(skip(state))]
 async fn get_state(State(state): State<ApiAppState>) -> Result<Json<ApiState>, ApiError> {
     let snapshot = load_snapshot_meta(&state.db_path)?;
     let leaderboard =
@@ -130,10 +135,12 @@ async fn get_state(State(state): State<ApiAppState>) -> Result<Json<ApiState>, A
     }))
 }
 
+#[tracing::instrument(skip(state))]
 async fn get_snapshot(State(state): State<ApiAppState>) -> Result<Json<SnapshotMeta>, ApiError> {
     Ok(Json(load_snapshot_meta(&state.db_path)?))
 }
 
+#[tracing::instrument(skip(state))]
 async fn get_leaderboard(
     State(state): State<ApiAppState>,
 ) -> Result<Json<Vec<LeaderboardViewRow>>, ApiError> {
@@ -142,6 +149,7 @@ async fn get_leaderboard(
     ))
 }
 
+#[tracing::instrument(skip(state))]
 async fn get_events(
     State(state): State<ApiAppState>,
     Query(query): Query<EventQuery>,
@@ -155,6 +163,7 @@ async fn get_events(
     )?))
 }
 
+#[tracing::instrument(skip(state))]
 async fn get_chart(
     State(state): State<ApiAppState>,
     Query(query): Query<ChartQuery>,
@@ -201,6 +210,7 @@ where
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
+        error!(error = %self.0, "api request failed");
         let body = serde_json::json!({ "error": self.0.to_string() });
         (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
     }
