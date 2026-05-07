@@ -20,8 +20,8 @@ use ratatui::{
     symbols,
     text::Line,
     widgets::{
-        Axis, Block, Borders, Cell, Chart, Dataset, GraphType, List, ListItem, Paragraph, Row,
-        Table, TableState,
+        Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, List, ListItem, Paragraph,
+        Row, Table, TableState,
     },
 };
 
@@ -80,6 +80,7 @@ struct App {
     search_mode: bool,
     search_input: String,
     chart_fullscreen: bool,
+    event_fullscreen: bool,
     show_help: bool,
     refresh_every: Duration,
     last_refresh: Instant,
@@ -120,6 +121,7 @@ impl App {
             search_mode: false,
             search_input: String::new(),
             chart_fullscreen: false,
+            event_fullscreen: false,
             show_help: false,
             refresh_every: Duration::from_secs(refresh_seconds.max(1)),
             last_refresh: Instant::now() - Duration::from_secs(refresh_seconds.max(1)),
@@ -151,7 +153,14 @@ impl App {
     }
 
     fn reload_chart_series(&mut self) -> Result<()> {
-        let teams: Vec<String> = self.compare_teams.iter().cloned().collect();
+        let teams: Vec<String> = if self.compare_teams.is_empty() {
+            self.selected_team
+                .iter()
+                .cloned()
+                .collect()
+        } else {
+            self.compare_teams.iter().cloned().collect()
+        };
         self.chart_series = team_chart_series(&self.conn, &teams)?;
         Ok(())
     }
@@ -206,6 +215,7 @@ impl App {
         self.table_state.select(Some(next));
         self.sync_selected_team();
         self.refresh_events()?;
+        self.reload_chart_series()?;
         Ok(())
     }
 
@@ -217,18 +227,19 @@ impl App {
         self.table_state.select(Some(next));
         self.sync_selected_team();
         self.refresh_events()?;
+        self.reload_chart_series()?;
         Ok(())
     }
 
     fn table_page_capacity(&self) -> usize {
-        current_view_layout(self.chart_fullscreen)
+        current_view_layout(self.chart_fullscreen, self.event_fullscreen)
             .map(|layout| table_visible_rows(layout.table))
             .unwrap_or(10)
             .max(1)
     }
 
     fn event_page_capacity(&self) -> usize {
-        current_view_layout(self.chart_fullscreen)
+        current_view_layout(self.chart_fullscreen, self.event_fullscreen)
             .map(|layout| events_visible_rows(layout.events))
             .unwrap_or(8)
             .max(1)
@@ -283,10 +294,29 @@ impl App {
     }
 
     fn clear_search(&mut self) -> Result<()> {
+        let preserve_team = self.selected_team.clone();
         self.search_mode = false;
         self.search_input.clear();
         self.apply_filter();
-        self.refresh_events()
+        if let Some(team_id) = preserve_team {
+            self.select_team_by_id(&team_id)?;
+        } else {
+            self.refresh_events()?;
+            self.reload_chart_series()?;
+        }
+        Ok(())
+    }
+
+    fn select_team_by_id(&mut self, team_id: &str) -> Result<()> {
+        if let Some(selected) = self
+            .filtered_indices
+            .iter()
+            .position(|idx| self.leaderboard[*idx].team_id == team_id)
+        {
+            self.set_selection(selected)?;
+            self.ensure_selection_visible();
+        }
+        Ok(())
     }
 
     fn jump_to_top(&mut self) -> Result<()> {
@@ -337,7 +367,20 @@ impl App {
     fn toggle_chart_fullscreen(&mut self) {
         self.chart_fullscreen = !self.chart_fullscreen;
         if self.chart_fullscreen {
+            self.event_fullscreen = false;
             self.focus = Focus::Chart;
+        } else {
+            self.focus = Focus::Table;
+        }
+    }
+
+    fn toggle_event_fullscreen(&mut self) {
+        self.event_fullscreen = !self.event_fullscreen;
+        if self.event_fullscreen {
+            self.chart_fullscreen = false;
+            self.focus = Focus::Events;
+        } else {
+            self.focus = Focus::Table;
         }
     }
 
@@ -346,7 +389,7 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
-        let layout = current_view_layout(self.chart_fullscreen)?;
+        let layout = current_view_layout(self.chart_fullscreen, self.event_fullscreen)?;
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 if contains(layout.table, mouse.column, mouse.row) {
@@ -431,15 +474,11 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(key) => {
-                    if key.kind != KeyEventKind::Press {
+                    if app.show_help {
+                        app.toggle_help();
                         continue;
                     }
-                    if app.show_help {
-                        match key.code {
-                            KeyCode::Char('h') | KeyCode::Esc => app.toggle_help(),
-                            KeyCode::Char('q') => break,
-                            _ => {}
-                        }
+                    if key.kind != KeyEventKind::Press {
                         continue;
                     }
                     if app.search_mode {
@@ -470,6 +509,10 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
                         KeyCode::Esc => {
                             if app.chart_fullscreen {
                                 app.chart_fullscreen = false;
+                                app.focus = Focus::Table;
+                            } else if app.event_fullscreen {
+                                app.event_fullscreen = false;
+                                app.focus = Focus::Table;
                             } else if !app.search_input.is_empty() {
                                 app.clear_search()?;
                             }
@@ -483,8 +526,11 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
                         KeyCode::Char('[') => app.page_by(-1)?,
                         KeyCode::Char(']') => app.page_by(1)?,
                         KeyCode::Char('o') => app.toggle_chart_fullscreen(),
+                        KeyCode::Char('O') => app.toggle_event_fullscreen(),
                         KeyCode::Char('h') => app.toggle_help(),
                         KeyCode::Tab => app.cycle_focus(),
+                        KeyCode::Char('J') => app.scroll_events(1),
+                        KeyCode::Char('K') => app.scroll_events(-1),
                         KeyCode::Down | KeyCode::Char('j') => {
                             match app.focus {
                                 Focus::Table => {
@@ -513,9 +559,17 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
                     }
                 }
                 Event::Mouse(mouse) => {
+                    if app.show_help {
+                        app.toggle_help();
+                        continue;
+                    }
                     app.handle_mouse(mouse)?;
                 }
-                _ => {}
+                _ => {
+                    if app.show_help {
+                        app.toggle_help();
+                    }
+                }
             }
         }
 
@@ -528,13 +582,13 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
 }
 
 fn render(frame: &mut Frame<'_>, app: &App) {
-    let layout = split_layout(frame.area(), app.chart_fullscreen);
+    let layout = split_layout(frame.area(), app.chart_fullscreen, app.event_fullscreen);
     render_table(frame, layout.table, app);
     render_events(frame, layout.events, app);
     render_chart(frame, layout.chart, app);
     render_status(frame, layout.status, app);
     if app.show_help {
-        render_help(frame, frame.area(), app.chart_fullscreen);
+        render_help(frame, frame.area(), app.chart_fullscreen || app.event_fullscreen);
     }
 }
 
@@ -645,7 +699,7 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
     let title = if app.compare_teams.is_empty() {
-        "Score Chart (press Space to add teams)"
+        "Score Chart (current team)"
     } else {
         "Score Chart"
     };
@@ -655,7 +709,13 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut max_y = 0.0_f64;
     let mut min_y = f64::MAX;
 
-    for team_id in &app.compare_teams {
+    let chart_team_ids: Vec<String> = if app.compare_teams.is_empty() {
+        app.selected_team.iter().cloned().collect()
+    } else {
+        app.compare_teams.iter().cloned().collect()
+    };
+
+    for team_id in &chart_team_ids {
         let points = app.chart_series.get(team_id).cloned().unwrap_or_default();
         if points.is_empty() {
             continue;
@@ -674,7 +734,7 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     if chart_data.is_empty() {
-        let placeholder = Paragraph::new("No teams selected for comparison")
+        let placeholder = Paragraph::new("No team selected")
             .block(
                 Block::default()
                     .title(title)
@@ -744,7 +804,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else if app.show_help {
         "h/Esc close help  q quit"
     } else {
-        "q quit  / search  h help  o chart  [ ] page  g/G jump"
+        "q quit  / search  h help  o chart  O events  [ ] page  g/G jump"
     };
     let help = format!(
         "{} | selected={} focus={:?} | {}",
@@ -763,6 +823,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, chart_fullscreen: bool) {
     let text = vec![
         Line::from("Navigation"),
         Line::from("j/k or Up/Down: move in focused panel"),
+        Line::from("J / K: scroll events window up / down"),
         Line::from("[ / ]: page up / page down in table or events"),
         Line::from("g / G: jump to top / bottom in table or events"),
         Line::from("Tab: cycle focus"),
@@ -770,8 +831,9 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, chart_fullscreen: bool) {
         Line::from("Views"),
         Line::from("Space: add/remove selected team from chart compare"),
         Line::from("o: toggle chart fullscreen"),
+        Line::from("O: toggle events fullscreen"),
         Line::from("/: start search"),
-        Line::from("Esc: clear search or exit chart fullscreen"),
+        Line::from("Esc: clear search or exit fullscreen"),
         Line::from(""),
         Line::from("Mouse"),
         Line::from("Single click row: select team"),
@@ -783,21 +845,28 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, chart_fullscreen: bool) {
         Line::from("h or Esc: close help"),
         Line::from("q: quit"),
     ];
-    let paragraph = Paragraph::new(text).block(
-        Block::default()
-            .title("Key Help")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
-    );
+    frame.render_widget(Clear, popup);
+    let paragraph = Paragraph::new(text)
+        .style(Style::default().bg(Color::Black).fg(Color::White))
+        .block(
+            Block::default()
+                .title("Key Help")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
     frame.render_widget(paragraph, popup);
 }
 
-fn current_view_layout(chart_fullscreen: bool) -> Result<ViewLayout> {
+fn current_view_layout(chart_fullscreen: bool, event_fullscreen: bool) -> Result<ViewLayout> {
     let (width, height) = size()?;
-    Ok(split_layout(Rect::new(0, 0, width, height), chart_fullscreen))
+    Ok(split_layout(
+        Rect::new(0, 0, width, height),
+        chart_fullscreen,
+        event_fullscreen,
+    ))
 }
 
-fn split_layout(area: Rect, chart_fullscreen: bool) -> ViewLayout {
+fn split_layout(area: Rect, chart_fullscreen: bool, event_fullscreen: bool) -> ViewLayout {
     if chart_fullscreen {
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -807,6 +876,18 @@ fn split_layout(area: Rect, chart_fullscreen: bool) -> ViewLayout {
             table: Rect::new(0, 0, 0, 0),
             events: Rect::new(0, 0, 0, 0),
             chart: layout[0],
+            status: layout[1],
+        };
+    }
+    if event_fullscreen {
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(area);
+        return ViewLayout {
+            table: Rect::new(0, 0, 0, 0),
+            events: layout[0],
+            chart: Rect::new(0, 0, 0, 0),
             status: layout[1],
         };
     }
