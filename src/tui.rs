@@ -209,6 +209,10 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
                 match key.code {
                     KeyCode::Esc => {
                         app.search_mode = false;
+                        app.search_input.clear();
+                        app.apply_filter();
+                        app.events =
+                            recent_events(&app.conn, app.selected_team.as_deref(), RECENT_EVENTS_LIMIT)?;
                     }
                     KeyCode::Enter => {
                         app.search_mode = false;
@@ -231,6 +235,14 @@ fn run_app(mut terminal: DefaultTerminal, conn: rusqlite::Connection, refresh_se
             match key.code {
                 KeyCode::Char('q') => break,
                 KeyCode::Char('r') => app.reload(true)?,
+                KeyCode::Esc => {
+                    if !app.search_input.is_empty() {
+                        app.search_input.clear();
+                        app.apply_filter();
+                        app.events =
+                            recent_events(&app.conn, app.selected_team.as_deref(), RECENT_EVENTS_LIMIT)?;
+                    }
+                }
                 KeyCode::Char('/') => {
                     app.search_mode = true;
                     app.status = "search mode".to_string();
@@ -462,8 +474,8 @@ fn border_style(active: bool) -> Style {
 
 fn format_rank_delta(delta: Option<i64>) -> String {
     match delta {
-        Some(value) if value > 0 => format!("+{}", value),
-        Some(value) if value < 0 => value.to_string(),
+        Some(value) if value > 0 => format!("↑{}", value),
+        Some(value) if value < 0 => format!("↓{}", value.abs()),
         Some(_) => "-".to_string(),
         None => "-".to_string(),
     }
