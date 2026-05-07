@@ -1,0 +1,12 @@
+[database]
+path = "lb-monitor.sqlite3"
+
+[fetch]
+url = "https://dataagent.top/leaderboard"
+interval_seconds = 300
+
+[notify]
+enabled = true
+
+[tui]
+refresh_seconds = 5
