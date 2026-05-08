@@ -571,6 +571,17 @@ impl App {
         self.show_help = !self.show_help;
     }
 
+    fn handle_help_key(&mut self, key: crossterm::event::KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('?') => self.toggle_help(),
+            _ => {}
+        }
+    }
+
     fn toggle_chart_mode(&mut self) {
         self.chart_mode = match self.chart_mode {
             ChartMode::Score => ChartMode::Rank,
@@ -754,7 +765,7 @@ fn run_app(
             match event::read()? {
                 Event::Key(key) => {
                     if app.show_help {
-                        app.toggle_help();
+                        app.handle_help_key(key);
                         continue;
                     }
                     if key.kind != KeyEventKind::Press {
@@ -807,7 +818,7 @@ fn run_app(
                         KeyCode::Char('o') => app.toggle_chart_fullscreen(),
                         KeyCode::Char('O') => app.toggle_event_fullscreen(),
                         KeyCode::Char('t') => app.toggle_chart_mode(),
-                        KeyCode::Char('h') => app.toggle_help(),
+                        KeyCode::Char('h') | KeyCode::Char('?') => app.toggle_help(),
                         KeyCode::Tab => app.cycle_focus(),
                         KeyCode::Char('J') => app.scroll_events(1),
                         KeyCode::Char('K') => app.scroll_events(-1),
@@ -848,11 +859,7 @@ fn run_app(
                     }
                     app.handle_mouse(mouse)?;
                 }
-                _ => {
-                    if app.show_help {
-                        app.toggle_help();
-                    }
-                }
+                _ => {}
             }
         }
 
@@ -1162,9 +1169,9 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let hints = if app.search_mode {
         "/ search  Esc clear  Enter apply  q quit"
     } else if app.show_help {
-        "h/Esc close help  q quit"
+        "h/?/Esc close help  q quit"
     } else {
-        "q quit  / search  h help  o chart  O events  t metric  [ ] page  g/G jump"
+        "q quit  / search  h/? help  o chart  O events  t metric  [ ] page  g/G jump"
     };
     let help = format!(
         "{} | selected={} focus={:?} | {} | {}",
@@ -1204,7 +1211,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, chart_fullscreen: bool) {
         Line::from(""),
         Line::from("General"),
         Line::from("r: reload from sqlite"),
-        Line::from("h or Esc: close help"),
+        Line::from("h, ? or Esc: close help"),
         Line::from("q: quit"),
     ];
     let paragraph = Paragraph::new(text)
