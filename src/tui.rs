@@ -23,8 +23,8 @@ use ratatui::{
     symbols,
     text::Line,
     widgets::{
-        Axis, Block, Borders, Cell, Chart, Dataset, GraphType, List, ListItem, Paragraph, Row,
-        Table, TableState,
+        Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, List, ListItem,
+        Paragraph, Row, Table, TableState,
     },
 };
 
@@ -1207,10 +1207,6 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, chart_fullscreen: bool) {
         Line::from("h or Esc: close help"),
         Line::from("q: quit"),
     ];
-    frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Black)),
-        popup,
-    );
     let paragraph = Paragraph::new(text)
         .style(Style::default().bg(Color::Black).fg(Color::White))
         .block(
@@ -1219,6 +1215,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, chart_fullscreen: bool) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         );
+    frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
 }
 
