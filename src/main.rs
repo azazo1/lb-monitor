@@ -41,8 +41,7 @@ fn main() -> Result<()> {
     info!(command = %command_summary, "starting lb-monitor");
     match resolved_command {
         Command::Tui(_) => tui::run(&loaded.config),
-        Command::Serve(args) => build_runtime()?
-            .block_on(serve(&loaded.config, args.once)),
+        Command::Serve(args) => build_runtime()?.block_on(serve(&loaded.config, args.once)),
         Command::Dummy(args) => dummy(&loaded.config, &args),
     }
 }
@@ -124,11 +123,7 @@ async fn serve(config: &config::Config, once: bool) -> Result<()> {
     }
 }
 
-fn run_fetch_cycle(
-    db_path: &Path,
-    url: &str,
-    notifier: &dyn Notifier,
-) -> Result<bool> {
+fn run_fetch_cycle(db_path: &Path, url: &str, notifier: &dyn Notifier) -> Result<bool> {
     let mut conn = open_rw(db_path)?;
     let page = fetch_leaderboard(url)?;
     let previous = previous_snapshot_rows(&conn)?;
@@ -145,7 +140,7 @@ fn run_fetch_cycle(
         &page.rows,
         &diff,
     )
-        .context("failed to persist leaderboard snapshot")?;
+    .context("failed to persist leaderboard snapshot")?;
     let (subject, body) = build_notification_message(
         is_initial_snapshot,
         &fetched_at,

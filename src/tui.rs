@@ -23,8 +23,8 @@ use ratatui::{
     symbols,
     text::Line,
     widgets::{
-        Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, List, ListItem,
-        Paragraph, Row, Table, TableState,
+        Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, List, ListItem, Paragraph,
+        Row, Table, TableState,
     },
 };
 

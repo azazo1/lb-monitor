@@ -155,9 +155,7 @@ async fn get_state(State(state): State<ApiAppState>) -> Result<Json<ApiState>, A
 #[tracing::instrument(skip(state))]
 async fn get_snapshot(State(state): State<ApiAppState>) -> Result<Json<SnapshotMeta>, ApiError> {
     let db_path = state.db_path.clone();
-    Ok(Json(
-        run_query(move || load_snapshot_meta(&db_path)).await?,
-    ))
+    Ok(Json(run_query(move || load_snapshot_meta(&db_path)).await?))
 }
 
 #[tracing::instrument(skip(state))]

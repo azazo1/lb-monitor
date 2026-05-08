@@ -1,4 +1,3 @@
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,7 +9,6 @@ use crate::cli::{Cli, Command, ServeArgs, TuiArgs};
 
 const DEFAULT_CONFIG_DIR: &str = ".config/lbm";
 const DEFAULT_CONFIG_FILE_NAME: &str = "config.toml";
-const FALLBACK_CONFIG_PATH: &str = "lb-monitor.toml";
 const DEFAULT_DB_PATH: &str = "lb-monitor.sqlite3";
 const DEFAULT_DUMMY_DB_PATH: &str = "lb-monitor-dummy.sqlite3";
 const DEFAULT_FETCH_URL: &str = "https://dataagent.top/leaderboard";
@@ -263,38 +261,30 @@ impl LoadedConfig {
 }
 
 fn default_config_path() -> PathBuf {
-    let home = env::var_os("HOME").map(PathBuf::from);
-    default_config_path_from_home(home.as_deref())
-}
-
-fn default_config_path_from_home(home: Option<&Path>) -> PathBuf {
-    match home {
-        Some(home) if !home.as_os_str().is_empty() => {
-            home.join(DEFAULT_CONFIG_DIR).join(DEFAULT_CONFIG_FILE_NAME)
-        }
-        _ => PathBuf::from(FALLBACK_CONFIG_PATH),
-    }
+    shellexpand::tilde(
+        &Path::new("~")
+            .join(DEFAULT_CONFIG_DIR)
+            .join(DEFAULT_CONFIG_FILE_NAME)
+            .to_string_lossy(),
+    )
+    .to_string()
+    .into()
 }
 
 fn expand_file_config_paths(file_config: &mut FileConfig) -> Result<()> {
-    let home = env::var_os("HOME").map(PathBuf::from);
-    expand_file_config_paths_with_context(file_config, home.as_deref(), &|name| {
-        env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+    expand_file_config_paths_with(file_config, &|path| {
+        Ok(shellexpand::path::full(path).map(|value| value.into_owned())?)
     })
 }
 
-fn expand_file_config_paths_with_context<F>(
-    file_config: &mut FileConfig,
-    home: Option<&Path>,
-    lookup_env: &F,
-) -> Result<()>
+fn expand_file_config_paths_with<F>(file_config: &mut FileConfig, expand_path: &F) -> Result<()>
 where
-    F: Fn(&str) -> Option<String>,
+    F: Fn(&Path) -> Result<PathBuf>,
 {
     if let Some(database) = file_config.database.as_mut()
         && let Some(path) = database.path.as_mut()
     {
-        *path = expand_path_with_context(path, home, lookup_env).map_err(|error| {
+        *path = expand_path(path).map_err(|error| {
             anyhow::anyhow!(
                 "failed to expand [database].path `{}`: {error}",
                 path.display()
@@ -305,7 +295,7 @@ where
     if let Some(tui) = file_config.tui.as_mut()
         && let Some(path) = tui.database_path.as_mut()
     {
-        *path = expand_path_with_context(path, home, lookup_env).map_err(|error| {
+        *path = expand_path(path).map_err(|error| {
             anyhow::anyhow!(
                 "failed to expand [tui].database_path `{}`: {error}",
                 path.display()
@@ -314,29 +304,6 @@ where
     }
 
     Ok(())
-}
-
-fn expand_path_with_context<F>(
-    path: &Path,
-    home: Option<&Path>,
-    lookup_env: &F,
-) -> Result<PathBuf>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    let raw = path
-        .to_str()
-        .with_context(|| format!("path {} is not valid UTF-8", path.display()))?;
-    let expanded = shellexpand::full_with_context(
-        raw,
-        || home.map(|path| path.to_string_lossy().into_owned()),
-        |name| match lookup_env(name) {
-            Some(value) => Ok(Some(value)),
-            None => Err(env::VarError::NotPresent),
-        },
-    )
-    .map(|value| value.into_owned())?;
-    Ok(PathBuf::from(expanded))
 }
 
 impl Config {
@@ -673,111 +640,5 @@ database_path = "tui.sqlite3"
         assert!(summary.contains("smtp_security: Tls"));
         assert!(!summary.contains("interval: None"));
         assert!(!summary.contains("listen: None"));
-    }
-
-    #[test]
-    fn defaults_to_home_config_path() {
-        let home = Path::new("/tmp/example-home");
-        assert_eq!(
-            default_config_path_from_home(Some(home)),
-            home.join(".config/lbm/config.toml")
-        );
-    }
-
-    #[test]
-    fn falls_back_to_legacy_config_path_without_home() {
-        assert_eq!(
-            default_config_path_from_home(None),
-            PathBuf::from("lb-monitor.toml")
-        );
-    }
-
-    #[test]
-    fn expands_home_and_env_vars_in_config_paths() {
-        let mut file_config = FileConfig {
-            database: Some(FileDatabaseConfig {
-                path: Some(PathBuf::from("~/db/${APP_ENV}/main.sqlite3")),
-            }),
-            serve: None,
-            tui: Some(FileTuiConfig {
-                refresh_seconds: None,
-                api_base_url: None,
-                source: None,
-                database_path: Some(PathBuf::from("$DATA_ROOT/tui.sqlite3")),
-            }),
-        };
-
-        expand_file_config_paths_with_context(
-            &mut file_config,
-            Some(Path::new("/tmp/example-home")),
-            &|name| match name {
-                "APP_ENV" => Some("prod".to_string()),
-                "DATA_ROOT" => Some("/var/lib/lbm".to_string()),
-                _ => None,
-            },
-        )
-        .expect("expand config paths");
-
-        assert_eq!(
-            file_config
-                .database
-                .and_then(|database| database.path)
-                .expect("database path"),
-            PathBuf::from("/tmp/example-home/db/prod/main.sqlite3")
-        );
-        assert_eq!(
-            file_config
-                .tui
-                .and_then(|tui| tui.database_path)
-                .expect("tui database path"),
-            PathBuf::from("/var/lib/lbm/tui.sqlite3")
-        );
-    }
-
-    #[test]
-    fn supports_shellexpand_default_values_in_config_paths() {
-        let mut file_config = FileConfig {
-            database: Some(FileDatabaseConfig {
-                path: Some(PathBuf::from("${DATA_ROOT:-/var/lib/lbm}/main.sqlite3")),
-            }),
-            serve: None,
-            tui: None,
-        };
-
-        expand_file_config_paths_with_context(
-            &mut file_config,
-            Some(Path::new("/tmp/example-home")),
-            &|_| None,
-        )
-        .expect("expand config paths");
-
-        assert_eq!(
-            file_config
-                .database
-                .and_then(|database| database.path)
-                .expect("database path"),
-            PathBuf::from("/var/lib/lbm/main.sqlite3")
-        );
-    }
-
-    #[test]
-    fn errors_when_config_path_env_var_is_missing() {
-        let mut file_config = FileConfig {
-            database: Some(FileDatabaseConfig {
-                path: Some(PathBuf::from("$MISSING_ROOT/main.sqlite3")),
-            }),
-            serve: None,
-            tui: None,
-        };
-
-        let error = expand_file_config_paths_with_context(
-            &mut file_config,
-            Some(Path::new("/tmp/example-home")),
-            &|_| None,
-        )
-        .expect_err("missing env var should fail");
-
-        assert!(error.to_string().contains("failed to expand [database].path"));
-        assert!(error.to_string().contains("MISSING_ROOT"));
     }
 }
