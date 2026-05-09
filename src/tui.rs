@@ -290,65 +290,45 @@ impl App {
         }
     }
 
-    async fn poll_async_updates(&mut self) {
-        self.poll_event_updates().await;
-        self.poll_chart_updates().await;
-    }
-
-    async fn poll_event_updates(&mut self) {
-        loop {
-            match self.event_loader.rx.try_recv() {
-                Ok(response) => {
-                    if response.request_id != self.event_loader.latest_request_id {
-                        continue;
-                    }
-                    self.events_loading = false;
-                    match response.result {
-                        Ok(events) => {
-                            self.events = events;
-                            self.events_scope = response.team_filter;
-                            self.event_scroll =
-                                self.event_scroll.min(self.events.len().saturating_sub(1));
-                        }
-                        Err(error) => {
-                            self.status = format!("failed to load events: {}", error);
-                        }
-                    }
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    self.events_loading = false;
-                    self.status = "event loader disconnected".to_string();
-                    break;
-                }
+    fn handle_event_update(&mut self, response: Option<EventLoadResponse>) {
+        let Some(response) = response else {
+            self.events_loading = false;
+            self.status = "event loader disconnected".to_string();
+            return;
+        };
+        if response.request_id != self.event_loader.latest_request_id {
+            return;
+        }
+        self.events_loading = false;
+        match response.result {
+            Ok(events) => {
+                self.events = events;
+                self.events_scope = response.team_filter;
+                self.event_scroll = self.event_scroll.min(self.events.len().saturating_sub(1));
+            }
+            Err(error) => {
+                self.status = format!("failed to load events: {}", error);
             }
         }
     }
 
-    async fn poll_chart_updates(&mut self) {
-        loop {
-            match self.chart_loader.rx.try_recv() {
-                Ok(response) => {
-                    if response.request_id != self.chart_loader.latest_request_id {
-                        continue;
-                    }
-                    self.chart_loading = false;
-                    match response.result {
-                        Ok(series) => {
-                            self.chart_series = series;
-                            self.chart_scope = response.team_ids;
-                        }
-                        Err(error) => {
-                            self.status = format!("failed to load chart: {}", error);
-                        }
-                    }
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    self.chart_loading = false;
-                    self.status = "chart loader disconnected".to_string();
-                    break;
-                }
+    fn handle_chart_update(&mut self, response: Option<ChartLoadResponse>) {
+        let Some(response) = response else {
+            self.chart_loading = false;
+            self.status = "chart loader disconnected".to_string();
+            return;
+        };
+        if response.request_id != self.chart_loader.latest_request_id {
+            return;
+        }
+        self.chart_loading = false;
+        match response.result {
+            Ok(series) => {
+                self.chart_series = series;
+                self.chart_scope = response.team_ids;
+            }
+            Err(error) => {
+                self.status = format!("failed to load chart: {}", error);
             }
         }
     }
@@ -760,7 +740,6 @@ async fn run_app(
     let mut reader = EventStream::new();
 
     loop {
-        app.poll_async_updates().await;
         terminal.draw(|frame| render(frame, &app))?;
 
         let refresh = tokio::time::sleep(Duration::from_millis(200));
@@ -870,10 +849,14 @@ async fn run_app(
                     None => break,
                 }
             }
+            response = app.event_loader.rx.recv() => {
+                app.handle_event_update(response);
+            }
+            response = app.chart_loader.rx.recv() => {
+                app.handle_chart_update(response);
+            }
             _ = &mut refresh => {}
         }
-
-        app.poll_async_updates().await;
 
         if app.last_refresh.elapsed() >= app.refresh_every {
             app.reload(false).await?;
