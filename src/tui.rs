@@ -246,6 +246,8 @@ impl App {
         } else {
             self.current_snapshot_id
         };
+        let preserved_team = self.selected_team.clone();
+        let preserved_selection = self.table_state.selected();
         let state = self.data_source.load_state(requested_snapshot_id).await?;
         let snapshot = state.snapshot;
         let current_snapshot_id = snapshot.current_snapshot_id;
@@ -262,6 +264,8 @@ impl App {
         self.leaderboard = state.leaderboard;
         self.clear_dependent_caches();
         self.apply_filter();
+        self.restore_selection(preserved_team.as_deref(), preserved_selection);
+        self.ensure_selection_visible();
         self.schedule_dependent_loads(true).await?;
         self.last_refresh = Instant::now();
         self.status = format!(
@@ -448,6 +452,25 @@ impl App {
             && let Some(idx) = self.filtered_indices.get(selected)
         {
             self.selected_team = Some(self.leaderboard[*idx].team_id.clone());
+        }
+    }
+
+    fn restore_selection(
+        &mut self,
+        preferred_team: Option<&str>,
+        fallback_selected: Option<usize>,
+    ) {
+        let selected = preferred_selection_index(
+            &self.leaderboard,
+            &self.filtered_indices,
+            preferred_team,
+            fallback_selected,
+        );
+        self.table_state.select(selected);
+        if selected.is_some() {
+            self.sync_selected_team();
+        } else {
+            self.selected_team = None;
         }
     }
 
@@ -1560,6 +1583,31 @@ fn table_index_from_mouse(area: Rect, row: u16, scroll: usize) -> Option<usize> 
     Some(scroll + (row - data_start) as usize)
 }
 
+fn preferred_selection_index(
+    leaderboard: &[LeaderboardViewRow],
+    filtered_indices: &[usize],
+    preferred_team: Option<&str>,
+    fallback_selected: Option<usize>,
+) -> Option<usize> {
+    if filtered_indices.is_empty() {
+        return None;
+    }
+
+    if let Some(team_id) = preferred_team
+        && let Some(selected) = filtered_indices
+            .iter()
+            .position(|idx| leaderboard[*idx].team_id == team_id)
+    {
+        return Some(selected);
+    }
+
+    Some(
+        fallback_selected
+            .unwrap_or(0)
+            .min(filtered_indices.len().saturating_sub(1)),
+    )
+}
+
 fn format_rank_delta(delta: Option<i64>) -> String {
     match delta {
         Some(value) if value > 0 => format!("↑{}", value),
@@ -1671,5 +1719,56 @@ fn format_chart_value(mode: ChartMode, value: f64) -> String {
     match mode {
         ChartMode::Score => format!("{value:.3}"),
         ChartMode::Rank => format!("{:.0}", value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(rank: i64, team_id: &str) -> LeaderboardViewRow {
+        LeaderboardViewRow {
+            team_id: team_id.to_string(),
+            rank,
+            score: rank as f64,
+            version: "v1".to_string(),
+            fetched_at: "2026-05-09T00:00:00Z".to_string(),
+            rank_delta: None,
+            score_delta: None,
+            is_new: false,
+        }
+    }
+
+    #[test]
+    fn keeps_focus_on_same_team_when_snapshot_changes() {
+        let leaderboard = vec![row(1, "alpha"), row(2, "beta"), row(3, "gamma")];
+        let filtered_indices = vec![0, 1, 2];
+
+        let selected =
+            preferred_selection_index(&leaderboard, &filtered_indices, Some("beta"), Some(0));
+
+        assert_eq!(selected, Some(1));
+    }
+
+    #[test]
+    fn falls_back_to_previous_position_when_team_disappears() {
+        let leaderboard = vec![row(1, "alpha"), row(2, "gamma")];
+        let filtered_indices = vec![0, 1];
+
+        let selected =
+            preferred_selection_index(&leaderboard, &filtered_indices, Some("beta"), Some(1));
+
+        assert_eq!(selected, Some(1));
+    }
+
+    #[test]
+    fn returns_none_when_no_rows_are_visible() {
+        let leaderboard = vec![row(1, "alpha")];
+        let filtered_indices = Vec::new();
+
+        let selected =
+            preferred_selection_index(&leaderboard, &filtered_indices, Some("alpha"), Some(0));
+
+        assert_eq!(selected, None);
     }
 }
