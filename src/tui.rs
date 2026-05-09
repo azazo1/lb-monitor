@@ -1,5 +1,5 @@
 use std::cmp::{max, min};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,10 @@ use crate::db::{ChartPoint, EventViewRow, LeaderboardViewRow};
 use crate::source::{TuiDataSource, build_tui_data_source};
 
 const RECENT_EVENTS_LIMIT: usize = 100;
+const SELECTION_DEBOUNCE: Duration = Duration::from_millis(140);
+const CHART_PREFETCH_RADIUS: usize = 2;
+const EVENT_CACHE_LIMIT: usize = 64;
+const CHART_CACHE_LIMIT: usize = 96;
 const CHART_COLORS: [Color; 6] = [
     Color::Cyan,
     Color::Yellow,
@@ -100,10 +104,15 @@ struct App {
     chart_fullscreen: bool,
     event_fullscreen: bool,
     show_help: bool,
+    pending_selection_sync_at: Option<Instant>,
     refresh_every: Duration,
     last_refresh: Instant,
     status: String,
     last_click: Option<ClickInfo>,
+    event_cache: HashMap<Option<String>, Vec<EventViewRow>>,
+    event_cache_order: VecDeque<Option<String>>,
+    chart_cache: HashMap<String, Vec<ChartPoint>>,
+    chart_cache_order: VecDeque<String>,
     event_loader: LoaderState<EventLoadRequest, EventLoadResponse>,
     chart_loader: LoaderState<ChartLoadRequest, ChartLoadResponse>,
 }
@@ -165,13 +174,14 @@ struct EventLoadResponse {
 #[derive(Debug)]
 struct ChartLoadRequest {
     request_id: u64,
-    team_ids: Vec<String>,
+    display_team_ids: Vec<String>,
+    fetch_team_ids: Vec<String>,
 }
 
 #[derive(Debug)]
 struct ChartLoadResponse {
     request_id: u64,
-    team_ids: Vec<String>,
+    display_team_ids: Vec<String>,
     result: std::result::Result<HashMap<String, Vec<ChartPoint>>, String>,
 }
 
@@ -202,10 +212,15 @@ impl App {
             chart_fullscreen: false,
             event_fullscreen: false,
             show_help: false,
+            pending_selection_sync_at: None,
             refresh_every: Duration::from_secs(refresh_seconds.max(1)),
             last_refresh: Instant::now() - Duration::from_secs(refresh_seconds.max(1)),
             status: String::new(),
             last_click: None,
+            event_cache: HashMap::new(),
+            event_cache_order: VecDeque::new(),
+            chart_cache: HashMap::new(),
+            chart_cache_order: VecDeque::new(),
             event_loader,
             chart_loader,
         };
@@ -217,12 +232,14 @@ impl App {
         let state = self.data_source.load_state().await?;
         let current_snapshot_id = state.latest_snapshot_id;
         if !force && current_snapshot_id == self.latest_snapshot_id {
+            self.last_refresh = Instant::now();
             return Ok(());
         }
         self.latest_snapshot_id = current_snapshot_id;
         self.leaderboard = state.leaderboard;
+        self.clear_dependent_caches();
         self.apply_filter();
-        self.schedule_dependent_loads().await?;
+        self.schedule_dependent_loads(true).await?;
         self.last_refresh = Instant::now();
         self.status = format!(
             "snapshot={} teams={} compare={}",
@@ -233,22 +250,41 @@ impl App {
         Ok(())
     }
 
-    async fn schedule_dependent_loads(&mut self) -> Result<()> {
-        self.schedule_event_refresh().await?;
-        self.schedule_chart_reload().await?;
+    async fn schedule_dependent_loads(&mut self, force: bool) -> Result<()> {
+        self.pending_selection_sync_at = None;
+        self.schedule_event_refresh(force).await?;
+        self.schedule_chart_reload(force).await?;
         Ok(())
     }
 
-    async fn schedule_selection_loads(&mut self) -> Result<()> {
-        self.schedule_event_refresh().await?;
+    fn queue_selection_sync(&mut self, immediate: bool) {
+        self.pending_selection_sync_at = Some(if immediate {
+            Instant::now()
+        } else {
+            Instant::now() + SELECTION_DEBOUNCE
+        });
+    }
+
+    async fn flush_selection_sync_if_due(&mut self) -> Result<()> {
+        let Some(deadline) = self.pending_selection_sync_at else {
+            return Ok(());
+        };
+        if Instant::now() < deadline {
+            return Ok(());
+        }
+        self.pending_selection_sync_at = None;
+        self.schedule_event_refresh(false).await?;
         if self.compare_teams.is_empty() {
-            self.schedule_chart_reload().await?;
+            self.schedule_chart_reload(false).await?;
         }
         Ok(())
     }
 
-    async fn schedule_event_refresh(&mut self) -> Result<()> {
+    async fn schedule_event_refresh(&mut self, force: bool) -> Result<()> {
         let selected_team = self.selected_team.clone();
+        if !force && self.apply_cached_events(&selected_team) {
+            return Ok(());
+        }
         let request_id = self.event_loader.issue_request_id();
         self.events_loading = true;
         self.events_scope = selected_team.clone();
@@ -263,20 +299,26 @@ impl App {
         Ok(())
     }
 
-    async fn schedule_chart_reload(&mut self) -> Result<()> {
-        let team_ids = self.chart_team_ids();
-        let request_id = self.chart_loader.issue_request_id();
-        self.chart_loading = !team_ids.is_empty();
-        self.chart_scope = team_ids.clone();
-        if team_ids.is_empty() {
+    async fn schedule_chart_reload(&mut self, force: bool) -> Result<()> {
+        let display_team_ids = self.chart_team_ids();
+        self.chart_scope = display_team_ids.clone();
+        if display_team_ids.is_empty() {
+            self.chart_loading = false;
             self.chart_series.clear();
             return Ok(());
         }
+        if !force && self.apply_cached_chart(&display_team_ids) {
+            return Ok(());
+        }
+        let request_id = self.chart_loader.issue_request_id();
+        let fetch_team_ids = self.prefetch_chart_team_ids(&display_team_ids);
+        self.chart_loading = true;
         self.chart_loader
             .tx
             .send(LoaderCommand::Load(ChartLoadRequest {
                 request_id,
-                team_ids,
+                display_team_ids,
+                fetch_team_ids,
             }))
             .map_err(|_| anyhow!("chart loader thread stopped unexpectedly"))?;
         Ok(())
@@ -302,8 +344,8 @@ impl App {
         self.events_loading = false;
         match response.result {
             Ok(events) => {
-                self.events = events;
-                self.events_scope = response.team_filter;
+                self.store_event_cache(response.team_filter.clone(), events);
+                self.apply_cached_events(&response.team_filter);
                 self.event_scroll = self.event_scroll.min(self.events.len().saturating_sub(1));
             }
             Err(error) => {
@@ -324,8 +366,9 @@ impl App {
         self.chart_loading = false;
         match response.result {
             Ok(series) => {
-                self.chart_series = series;
-                self.chart_scope = response.team_ids;
+                self.store_chart_cache(series);
+                self.apply_cached_chart(&response.display_team_ids);
+                self.chart_scope = response.display_team_ids;
             }
             Err(error) => {
                 self.status = format!("failed to load chart: {}", error);
@@ -368,28 +411,131 @@ impl App {
         }
     }
 
-    async fn move_selection(&mut self, delta: isize) -> Result<()> {
+    fn clear_dependent_caches(&mut self) {
+        self.event_cache.clear();
+        self.event_cache_order.clear();
+        self.chart_cache.clear();
+        self.chart_cache_order.clear();
+    }
+
+    fn apply_cached_events(&mut self, team_filter: &Option<String>) -> bool {
+        let Some(events) = self.event_cache.get(team_filter).cloned() else {
+            return false;
+        };
+        self.events = events;
+        self.events_scope = team_filter.clone();
+        self.events_loading = false;
+        self.event_scroll = 0;
+        self.touch_event_cache_key(team_filter);
+        true
+    }
+
+    fn store_event_cache(&mut self, team_filter: Option<String>, events: Vec<EventViewRow>) {
+        let key = team_filter;
+        self.event_cache.insert(key.clone(), events);
+        self.touch_event_cache_key(&key);
+        while self.event_cache.len() > EVENT_CACHE_LIMIT {
+            if let Some(oldest) = self.event_cache_order.pop_front() {
+                self.event_cache.remove(&oldest);
+            }
+        }
+    }
+
+    fn touch_event_cache_key(&mut self, key: &Option<String>) {
+        if let Some(index) = self.event_cache_order.iter().position(|item| item == key) {
+            self.event_cache_order.remove(index);
+        }
+        self.event_cache_order.push_back(key.clone());
+    }
+
+    fn apply_cached_chart(&mut self, display_team_ids: &[String]) -> bool {
+        if display_team_ids
+            .iter()
+            .any(|team_id| !self.chart_cache.contains_key(team_id))
+        {
+            return false;
+        }
+        self.chart_series = display_team_ids
+            .iter()
+            .map(|team_id| {
+                (
+                    team_id.clone(),
+                    self.chart_cache.get(team_id).cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        self.chart_scope = display_team_ids.to_vec();
+        self.chart_loading = false;
+        for team_id in display_team_ids {
+            self.touch_chart_cache_key(team_id);
+        }
+        true
+    }
+
+    fn store_chart_cache(&mut self, series: HashMap<String, Vec<ChartPoint>>) {
+        for (team_id, points) in series {
+            self.chart_cache.insert(team_id.clone(), points);
+            self.touch_chart_cache_key(&team_id);
+        }
+        while self.chart_cache.len() > CHART_CACHE_LIMIT {
+            if let Some(oldest) = self.chart_cache_order.pop_front() {
+                self.chart_cache.remove(&oldest);
+            }
+        }
+    }
+
+    fn touch_chart_cache_key(&mut self, key: &str) {
+        if let Some(index) = self.chart_cache_order.iter().position(|item| item == key) {
+            self.chart_cache_order.remove(index);
+        }
+        self.chart_cache_order.push_back(key.to_string());
+    }
+
+    fn prefetch_chart_team_ids(&self, display_team_ids: &[String]) -> Vec<String> {
+        let mut team_ids = BTreeSet::new();
+        for team_id in display_team_ids {
+            team_ids.insert(team_id.clone());
+        }
+        if self.compare_teams.is_empty()
+            && let Some(selected) = self.table_state.selected()
+            && !self.filtered_indices.is_empty()
+        {
+            let start = selected.saturating_sub(CHART_PREFETCH_RADIUS);
+            let end = min(
+                selected + CHART_PREFETCH_RADIUS,
+                self.filtered_indices.len().saturating_sub(1),
+            );
+            for position in start..=end {
+                if let Some(row_index) = self.filtered_indices.get(position)
+                    && let Some(row) = self.leaderboard.get(*row_index)
+                {
+                    team_ids.insert(row.team_id.clone());
+                }
+            }
+        }
+        team_ids.into_iter().collect()
+    }
+
+    fn move_selection(&mut self, delta: isize) {
         if self.filtered_indices.is_empty() {
-            return Ok(());
+            return;
         }
         let current = self.table_state.selected().unwrap_or(0) as isize;
         let len = self.filtered_indices.len() as isize;
         let next = min(max(current + delta, 0), len - 1) as usize;
         self.table_state.select(Some(next));
         self.sync_selected_team();
-        self.schedule_selection_loads().await?;
-        Ok(())
+        self.queue_selection_sync(false);
     }
 
-    async fn set_selection(&mut self, selected: usize) -> Result<()> {
+    fn set_selection(&mut self, selected: usize) {
         if self.filtered_indices.is_empty() {
-            return Ok(());
+            return;
         }
         let next = selected.min(self.filtered_indices.len().saturating_sub(1));
         self.table_state.select(Some(next));
         self.sync_selected_team();
-        self.schedule_selection_loads().await?;
-        Ok(())
+        self.queue_selection_sync(false);
     }
 
     fn table_page_capacity(&self) -> usize {
@@ -436,13 +582,13 @@ impl App {
             self.compare_teams.remove(&team_id);
         }
         if !self.filtered_indices.is_empty() {
-            self.move_selection(1).await?;
+            self.move_selection(1);
             self.ensure_selection_visible();
         } else {
-            self.schedule_selection_loads().await?;
+            self.queue_selection_sync(true);
         }
         if !self.compare_teams.is_empty() {
-            self.schedule_chart_reload().await?;
+            self.schedule_chart_reload(true).await?;
         }
         Ok(())
     }
@@ -463,7 +609,7 @@ impl App {
         if let Some(team_id) = preserve_team {
             self.select_team_by_id(&team_id).await?;
         } else {
-            self.schedule_dependent_loads().await?;
+            self.schedule_dependent_loads(true).await?;
         }
         Ok(())
     }
@@ -474,7 +620,7 @@ impl App {
             .iter()
             .position(|idx| self.leaderboard[*idx].team_id == team_id)
         {
-            self.set_selection(selected).await?;
+            self.set_selection(selected);
             self.ensure_selection_visible();
         }
         Ok(())
@@ -484,7 +630,7 @@ impl App {
         match self.focus {
             Focus::Table => {
                 self.table_scroll = 0;
-                self.set_selection(0).await?;
+                self.set_selection(0);
             }
             Focus::Events => {
                 self.event_scroll = 0;
@@ -498,7 +644,7 @@ impl App {
         match self.focus {
             Focus::Table => {
                 let last = self.filtered_indices.len().saturating_sub(1);
-                self.set_selection(last).await?;
+                self.set_selection(last);
                 self.ensure_selection_visible();
             }
             Focus::Events => {
@@ -513,7 +659,7 @@ impl App {
         match self.focus {
             Focus::Table => {
                 let step = self.table_page_capacity() as isize;
-                self.move_selection(delta * step).await?;
+                self.move_selection(delta * step);
                 self.ensure_selection_visible();
             }
             Focus::Events => {
@@ -573,7 +719,7 @@ impl App {
             MouseEventKind::ScrollUp => {
                 if contains(layout.table, mouse.column, mouse.row) {
                     self.focus = Focus::Table;
-                    self.move_selection(-1).await?;
+                    self.move_selection(-1);
                     self.ensure_selection_visible();
                 } else if contains(layout.events, mouse.column, mouse.row) {
                     self.focus = Focus::Events;
@@ -583,7 +729,7 @@ impl App {
             MouseEventKind::ScrollDown => {
                 if contains(layout.table, mouse.column, mouse.row) {
                     self.focus = Focus::Table;
-                    self.move_selection(1).await?;
+                    self.move_selection(1);
                     self.ensure_selection_visible();
                 } else if contains(layout.events, mouse.column, mouse.row) {
                     self.focus = Focus::Events;
@@ -597,7 +743,7 @@ impl App {
                         table_index_from_mouse(layout.table, mouse.row, self.table_scroll)
                         && clicked < self.filtered_indices.len()
                     {
-                        self.set_selection(clicked).await?;
+                        self.set_selection(clicked);
                         self.ensure_selection_visible();
                         let team_id = self.selected_team.clone();
                         if self.is_double_click(Focus::Table, team_id.as_deref()) {
@@ -704,13 +850,13 @@ fn spawn_chart_loader(
                         }
                     }
                     let result = data_source
-                        .load_chart(&request.team_ids)
+                        .load_chart(&request.fetch_team_ids)
                         .await
                         .map_err(|error| error.to_string());
                     if tx_results
                         .send(ChartLoadResponse {
                             request_id: request.request_id,
-                            team_ids: request.team_ids,
+                            display_team_ids: request.display_team_ids,
                             result,
                         })
                         .is_err()
@@ -764,7 +910,7 @@ async fn run_app(
                                 KeyCode::Enter => {
                                     app.search_mode = false;
                                     app.apply_filter();
-                                    app.schedule_selection_loads().await?;
+                                    app.queue_selection_sync(true);
                                 }
                                 KeyCode::Backspace => {
                                     app.search_input.pop();
@@ -809,7 +955,7 @@ async fn run_app(
                             KeyCode::Char('K') => app.scroll_events(-1),
                             KeyCode::Down | KeyCode::Char('j') => match app.focus {
                                 Focus::Table => {
-                                    app.move_selection(1).await?;
+                                    app.move_selection(1);
                                     app.ensure_selection_visible();
                                 }
                                 Focus::Events => app.scroll_events(1),
@@ -817,14 +963,15 @@ async fn run_app(
                             },
                             KeyCode::Up | KeyCode::Char('k') => match app.focus {
                                 Focus::Table => {
-                                    app.move_selection(-1).await?;
+                                    app.move_selection(-1);
                                     app.ensure_selection_visible();
                                 }
                                 Focus::Events => app.scroll_events(-1),
                                 Focus::Chart => {}
                             },
                             KeyCode::Enter => {
-                                app.schedule_event_refresh().await?;
+                                app.pending_selection_sync_at = None;
+                                app.schedule_event_refresh(true).await?;
                             }
                             KeyCode::Char(' ') => app.toggle_compare().await?,
                             _ => {}
@@ -857,6 +1004,8 @@ async fn run_app(
             }
             _ = &mut refresh => {}
         }
+
+        app.flush_selection_sync_if_due().await?;
 
         if app.last_refresh.elapsed() >= app.refresh_every {
             app.reload(false).await?;
