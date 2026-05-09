@@ -27,6 +27,8 @@ pub struct LeaderboardState {
 }
 
 pub fn load_leaderboard_state(db_path: &Path, policy: SnapshotPolicy) -> Result<LeaderboardState> {
+    let span = tracing::info_span!("load_leaderboard_state", db_path = %db_path.display());
+    let _entered = span.enter();
     let conn = open_query_connection(db_path, policy)?;
     Ok(LeaderboardState {
         latest_snapshot_id: latest_snapshot_id(&conn)?,
@@ -40,6 +42,8 @@ pub fn load_recent_events(
     limit: usize,
     policy: SnapshotPolicy,
 ) -> Result<Vec<EventViewRow>> {
+    let span = tracing::info_span!("load_recent_events", db_path = %db_path.display(), limit);
+    let _entered = span.enter();
     let conn = open_query_connection(db_path, policy)?;
     recent_events(&conn, team_filter, limit)
 }
@@ -49,11 +53,15 @@ pub fn load_chart_series(
     team_ids: &[String],
     policy: SnapshotPolicy,
 ) -> Result<HashMap<String, Vec<ChartPoint>>> {
+    let span = tracing::info_span!("load_chart_series", db_path = %db_path.display(), team_count = team_ids.len());
+    let _entered = span.enter();
     let conn = open_query_connection(db_path, policy)?;
     team_chart_series(&conn, team_ids)
 }
 
 pub fn load_snapshot_meta(db_path: &Path) -> Result<SnapshotMeta> {
+    let span = tracing::info_span!("load_snapshot_meta", db_path = %db_path.display());
+    let _entered = span.enter();
     let conn = open_ro(db_path)?;
     Ok(SnapshotMeta {
         latest_snapshot_id: latest_snapshot_id(&conn)?,
@@ -61,6 +69,12 @@ pub fn load_snapshot_meta(db_path: &Path) -> Result<SnapshotMeta> {
 }
 
 fn open_query_connection(db_path: &Path, policy: SnapshotPolicy) -> Result<rusqlite::Connection> {
+    let span = tracing::info_span!(
+        "open_query_connection",
+        db_path = %db_path.display(),
+        allow_empty = matches!(policy, SnapshotPolicy::AllowEmpty)
+    );
+    let _entered = span.enter();
     let conn = open_ro(db_path)?;
     if matches!(policy, SnapshotPolicy::RequireExisting) {
         assert_has_snapshots(&conn)?;

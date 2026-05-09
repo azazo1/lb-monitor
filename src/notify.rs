@@ -19,6 +19,8 @@ pub struct NoopNotifier;
 
 impl MailNotifier {
     pub fn new(config: &MailConfig) -> Result<Self> {
+        let span = tracing::info_span!("mail_notifier_new");
+        let _entered = span.enter();
         let smtp = &config.smtp;
         if smtp.host.is_empty() {
             return Err(anyhow!("smtp host is required when mail is enabled"));
@@ -63,6 +65,8 @@ impl MailNotifier {
     }
 
     fn build_message(&self, subject: &str, body: &str) -> Result<Message> {
+        let span = tracing::info_span!("build_mail_message", subject = %subject);
+        let _entered = span.enter();
         let mut builder = Message::builder().from(self.from.clone()).subject(subject);
         for recipient in &self.to {
             builder = builder.to(recipient.clone());
@@ -75,6 +79,8 @@ impl MailNotifier {
 
 impl Notifier for MailNotifier {
     fn notify_update(&self, subject: &str, body: &str) -> Result<()> {
+        let span = tracing::info_span!("notify_update", subject = %subject);
+        let _entered = span.enter();
         let message = self.build_message(subject, body)?;
         self.mailer
             .send(&message)
@@ -85,6 +91,8 @@ impl Notifier for MailNotifier {
 
 impl Notifier for NoopNotifier {
     fn notify_update(&self, _subject: &str, _body: &str) -> Result<()> {
+        let span = tracing::info_span!("noop_notify_update");
+        let _entered = span.enter();
         Ok(())
     }
 }

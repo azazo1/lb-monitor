@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::runtime::Builder;
 use tokio::task;
-use tracing::{error, info};
+use tracing::{error, info, Instrument};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::cli::{Cli, Command, DummyArgs};
@@ -53,6 +53,7 @@ fn build_runtime() -> Result<tokio::runtime::Runtime> {
         .context("failed to build tokio runtime")
 }
 
+#[tracing::instrument(skip(config))]
 async fn serve(config: &config::Config, once: bool) -> Result<()> {
     info!(once, "starting serve loop");
     let notifier: Arc<dyn Notifier> = if config.serve.mail.enabled {
@@ -63,7 +64,7 @@ async fn serve(config: &config::Config, once: bool) -> Result<()> {
     let db_path = config.database.path.clone();
     let fetch_url = config.serve.fetch.url.clone();
     if once {
-        run_fetch_cycle_async(db_path, fetch_url, notifier).await?;
+        run_fetch_cycle(db_path, fetch_url, notifier).await?;
         info!("completed single fetch cycle");
         return Ok(());
     }
@@ -71,23 +72,26 @@ async fn serve(config: &config::Config, once: bool) -> Result<()> {
     let mut api_server =
         api::spawn_http_server(config.database.path.clone(), &config.serve.http.listen).await?;
     let interval = Duration::from_secs(config.serve.fetch.interval_seconds.max(1));
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
-        let mut fetch_cycle = task::spawn_blocking({
-            let db_path = db_path.clone();
-            let fetch_url = fetch_url.clone();
-            let notifier = Arc::clone(&notifier);
-            move || run_fetch_cycle(&db_path, &fetch_url, notifier.as_ref())
-        });
+        let fetch_span = tracing::info_span!("fetch_cycle", url = %fetch_url);
+        let mut fetch_cycle = Box::pin(
+            run_fetch_cycle(db_path.clone(), fetch_url.clone(), Arc::clone(&notifier))
+                .instrument(fetch_span.clone()),
+        );
 
         tokio::select! {
             result = &mut fetch_cycle => {
+                let _entered = fetch_span.enter();
                 log_fetch_cycle_result(result)?;
             }
-            result = tokio::signal::ctrl_c() => {
-                result.context("failed to install Ctrl-C handler")?;
+            result = &mut shutdown => {
+                result?;
                 info!("shutdown signal received, waiting for current fetch cycle to finish");
                 api_server.request_shutdown();
+                let _entered = fetch_span.enter();
                 log_fetch_cycle_result(fetch_cycle.await)?;
                 api_server.join().await?;
                 info!("graceful shutdown completed");
@@ -103,8 +107,8 @@ async fn serve(config: &config::Config, once: bool) -> Result<()> {
         }
 
         tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                result.context("failed to install Ctrl-C handler")?;
+            result = &mut shutdown => {
+                result?;
                 info!("shutdown signal received");
                 api_server.request_shutdown();
                 api_server.join().await?;
@@ -123,9 +127,29 @@ async fn serve(config: &config::Config, once: bool) -> Result<()> {
     }
 }
 
-fn run_fetch_cycle(db_path: &Path, url: &str, notifier: &dyn Notifier) -> Result<bool> {
+#[tracing::instrument(skip(db_path, notifier), fields(url = %url))]
+async fn run_fetch_cycle(
+    db_path: std::path::PathBuf,
+    url: String,
+    notifier: Arc<dyn Notifier>,
+) -> Result<bool> {
+    let page = fetch_leaderboard(&url).await?;
+    let span = tracing::Span::current();
+    task::spawn_blocking(move || {
+        let _entered = span.enter();
+        run_fetch_cycle_blocking(&db_path, page, notifier.as_ref())
+    })
+    .await
+    .context("fetch cycle task join failed")?
+}
+
+#[tracing::instrument(skip(db_path, page, notifier))]
+fn run_fetch_cycle_blocking(
+    db_path: &Path,
+    page: crate::parse::LeaderboardPage,
+    notifier: &dyn Notifier,
+) -> Result<bool> {
     let mut conn = open_rw(db_path)?;
-    let page = fetch_leaderboard(url)?;
     let previous = previous_snapshot_rows(&conn)?;
     let diff = diff_rows(&previous, &page.rows, page.source_updated_at.as_deref());
 
@@ -160,20 +184,10 @@ fn run_fetch_cycle(db_path: &Path, url: &str, notifier: &dyn Notifier) -> Result
     Ok(true)
 }
 
-async fn run_fetch_cycle_async(
-    db_path: std::path::PathBuf,
-    fetch_url: String,
-    notifier: Arc<dyn Notifier>,
-) -> Result<bool> {
-    task::spawn_blocking(move || run_fetch_cycle(&db_path, &fetch_url, notifier.as_ref()))
-        .await
-        .context("fetch cycle task join failed")?
-}
-
 fn log_fetch_cycle_result(
-    result: std::result::Result<Result<bool>, task::JoinError>,
+    result: Result<bool>,
 ) -> Result<()> {
-    match result.context("fetch cycle task join failed")? {
+    match result {
         Ok(_) => Ok(()),
         Err(error) => {
             error!(%error, "fetch cycle failed");
@@ -302,6 +316,28 @@ fn init_tracing() {
         .with(filter)
         .with(fmt::layer().with_target(false).compact());
     let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigint = signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
+
+    tokio::select! {
+        _ = sigint.recv() => {}
+        _ = sigterm.recv() => {}
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to install Ctrl-C handler")
 }
 
 #[cfg(test)]

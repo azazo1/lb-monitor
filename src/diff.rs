@@ -47,6 +47,8 @@ pub fn diff_rows(
     current_rows: &[LeaderboardRow],
     source_updated_at: Option<&str>,
 ) -> DiffResult {
+    let span = tracing::info_span!("diff_rows", current_count = current_rows.len());
+    let _entered = span.enter();
     let content_hash = build_content_hash(current_rows, source_updated_at);
     let current_map: HashMap<&str, &LeaderboardRow> = current_rows
         .iter()
@@ -139,6 +141,8 @@ pub fn diff_rows(
 }
 
 fn build_content_hash(rows: &[LeaderboardRow], source_updated_at: Option<&str>) -> String {
+    let span = tracing::info_span!("build_content_hash", row_count = rows.len());
+    let _entered = span.enter();
     let mut hasher = Sha256::new();
     if let Some(source_updated_at) = source_updated_at {
         hasher.update(source_updated_at.as_bytes());

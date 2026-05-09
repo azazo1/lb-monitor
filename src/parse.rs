@@ -18,6 +18,8 @@ pub struct LeaderboardRow {
 }
 
 pub fn parse_leaderboard(html: &str) -> Result<LeaderboardPage> {
+    let span = tracing::info_span!("parse_leaderboard");
+    let _entered = span.enter();
     let document = Html::parse_document(html);
     let source_updated_at = extract_source_updated_at(&document);
     let structured_rows = parse_structured_rows(&document);
@@ -38,6 +40,8 @@ pub fn parse_leaderboard(html: &str) -> Result<LeaderboardPage> {
 }
 
 pub fn parse_leaderboard_bundle(bundle: &str) -> Result<LeaderboardPage> {
+    let span = tracing::info_span!("parse_leaderboard_bundle");
+    let _entered = span.enter();
     let source_updated_at = extract_source_updated_at_from_text(bundle);
     let rows = parse_bundle_rows(bundle);
 
@@ -52,6 +56,8 @@ pub fn parse_leaderboard_bundle(bundle: &str) -> Result<LeaderboardPage> {
 }
 
 pub fn extract_bundle_path(html: &str) -> Option<String> {
+    let span = tracing::info_span!("extract_bundle_path");
+    let _entered = span.enter();
     let document = Html::parse_document(html);
     let selector = Selector::parse(r#"script[src]"#).ok()?;
 

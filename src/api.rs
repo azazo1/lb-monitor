@@ -69,6 +69,8 @@ impl ApiClient {
 
     fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
+        let span = tracing::info_span!("api_client_request", url = %url);
+        let _entered = span.enter();
         let response = self
             .client
             .get(&url)
@@ -241,7 +243,11 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
-    task::spawn_blocking(job)
+    let span = tracing::Span::current();
+    task::spawn_blocking(move || {
+        let _entered = span.enter();
+        job()
+    })
         .await
         .context("query task join failed")?
         .map_err(ApiError::from)

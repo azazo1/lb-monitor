@@ -43,6 +43,8 @@ pub struct ChartPoint {
 }
 
 pub fn open_rw(path: &Path) -> Result<Connection> {
+    let span = tracing::info_span!("open_rw", db_path = %path.display());
+    let _entered = span.enter();
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open sqlite database {}", path.display()))?;
     init_db(&conn)?;
@@ -50,6 +52,8 @@ pub fn open_rw(path: &Path) -> Result<Connection> {
 }
 
 pub fn open_ro(path: &Path) -> Result<Connection> {
+    let span = tracing::info_span!("open_ro", db_path = %path.display());
+    let _entered = span.enter();
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("failed to open sqlite database {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL").ok();
@@ -57,6 +61,8 @@ pub fn open_ro(path: &Path) -> Result<Connection> {
 }
 
 pub fn init_db(conn: &Connection) -> Result<()> {
+    let span = tracing::info_span!("init_db");
+    let _entered = span.enter();
     conn.pragma_update(None, "journal_mode", "WAL")
         .context("failed to enable sqlite WAL mode")?;
     conn.execute_batch(
@@ -114,6 +120,8 @@ CREATE INDEX IF NOT EXISTS idx_team_events_team_id ON team_events(team_id);
 }
 
 pub fn latest_snapshot_id(conn: &Connection) -> Result<Option<i64>> {
+    let span = tracing::info_span!("latest_snapshot_id");
+    let _entered = span.enter();
     conn.query_row(
         "SELECT id FROM snapshots ORDER BY id DESC LIMIT 1",
         [],
@@ -124,6 +132,8 @@ pub fn latest_snapshot_id(conn: &Connection) -> Result<Option<i64>> {
 }
 
 pub fn previous_snapshot_rows(conn: &Connection) -> Result<HashMap<String, PreviousEntry>> {
+    let span = tracing::info_span!("previous_snapshot_rows");
+    let _entered = span.enter();
     let Some(snapshot_id) = latest_snapshot_id(conn)? else {
         return Ok(HashMap::new());
     };
@@ -174,6 +184,12 @@ fn insert_snapshot_at(
     diff: &DiffResult,
     fetched_at: &str,
 ) -> Result<String> {
+    let span = tracing::info_span!(
+        "insert_snapshot",
+        source_updated_at = source_updated_at.unwrap_or("-"),
+        row_count = rows.len()
+    );
+    let _entered = span.enter();
     let transaction = conn.transaction().context("failed to start transaction")?;
     transaction.execute(
         r#"
@@ -246,6 +262,8 @@ INSERT INTO team_events (
 }
 
 fn upsert_team(conn: &Connection, team_id: &str, timestamp: &str) -> Result<i64> {
+    let span = tracing::info_span!("upsert_team", team_id = %team_id);
+    let _entered = span.enter();
     conn.execute(
         r#"
 INSERT INTO teams (external_team_id, first_seen_at, last_seen_at)
@@ -264,6 +282,8 @@ ON CONFLICT(external_team_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
 }
 
 pub fn latest_leaderboard(conn: &Connection) -> Result<Vec<LeaderboardViewRow>> {
+    let span = tracing::info_span!("latest_leaderboard");
+    let _entered = span.enter();
     let Some(snapshot_id) = latest_snapshot_id(conn)? else {
         return Ok(Vec::new());
     };
@@ -339,6 +359,8 @@ pub fn recent_events(
     team_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<EventViewRow>> {
+    let span = tracing::info_span!("recent_events", limit);
+    let _entered = span.enter();
     let query = if team_filter.is_some() {
         r#"
 SELECT s.fetched_at, t.external_team_id, te.event_type, te.old_rank, te.new_rank, te.old_score, te.new_score, te.old_version, te.new_version
@@ -373,6 +395,8 @@ LIMIT ?1
 }
 
 fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventViewRow> {
+    let span = tracing::info_span!("map_event_row");
+    let _entered = span.enter();
     Ok(EventViewRow {
         fetched_at: row.get(0)?,
         team_id: row.get(1)?,
@@ -390,6 +414,8 @@ pub fn team_chart_series(
     conn: &Connection,
     team_ids: &[String],
 ) -> Result<HashMap<String, Vec<ChartPoint>>> {
+    let span = tracing::info_span!("team_chart_series", team_count = team_ids.len());
+    let _entered = span.enter();
     let mut result = HashMap::new();
     for team_id in team_ids {
         let mut statement = conn.prepare(
@@ -428,6 +454,8 @@ ORDER BY s.id ASC
 }
 
 pub fn assert_has_snapshots(conn: &Connection) -> Result<()> {
+    let span = tracing::info_span!("assert_has_snapshots");
+    let _entered = span.enter();
     if latest_snapshot_id(conn)?.is_some() {
         Ok(())
     } else {
@@ -442,6 +470,8 @@ pub fn replace_with_dummy_data(
     snapshots: usize,
     teams: usize,
 ) -> Result<()> {
+    let span = tracing::info_span!("replace_with_dummy_data", snapshots, teams);
+    let _entered = span.enter();
     let snapshots = snapshots.max(1);
     let teams = teams.max(3);
     conn.execute_batch(
