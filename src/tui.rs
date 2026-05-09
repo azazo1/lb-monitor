@@ -1,21 +1,20 @@
 use std::cmp::{max, min};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-        MouseEvent, MouseEventKind,
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
+        MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
     },
 };
+use futures_util::StreamExt;
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -27,6 +26,7 @@ use ratatui::{
         Row, Table, TableState,
     },
 };
+use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::db::{ChartPoint, EventViewRow, LeaderboardViewRow};
@@ -42,7 +42,7 @@ const CHART_COLORS: [Color; 6] = [
     Color::LightRed,
 ];
 
-pub fn run(config: &Config) -> Result<()> {
+pub async fn run(config: &Config) -> Result<()> {
     let data_source = build_tui_data_source(config)?;
 
     enable_raw_mode()?;
@@ -50,7 +50,7 @@ pub fn run(config: &Config) -> Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let terminal = ratatui::init();
 
-    let result = run_app(terminal, data_source, config.tui.refresh_seconds);
+    let result = run_app(terminal, data_source, config.tui.refresh_seconds).await;
     ratatui::restore();
     disable_raw_mode()?;
     execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
@@ -129,9 +129,9 @@ enum LoaderCommand<Request> {
 }
 
 struct LoaderState<Request, Response> {
-    tx: Sender<LoaderCommand<Request>>,
-    rx: Receiver<Response>,
-    handle: Option<JoinHandle<()>>,
+    tx: mpsc::UnboundedSender<LoaderCommand<Request>>,
+    rx: mpsc::UnboundedReceiver<Response>,
+    handle: tokio::task::JoinHandle<()>,
     next_request_id: u64,
     latest_request_id: u64,
 }
@@ -145,9 +145,7 @@ impl<Request, Response> LoaderState<Request, Response> {
 
     fn shutdown(&mut self) {
         let _ = self.tx.send(LoaderCommand::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        self.handle.abort();
     }
 }
 
@@ -178,7 +176,7 @@ struct ChartLoadResponse {
 }
 
 impl App {
-    fn new(data_source: Arc<dyn TuiDataSource>, refresh_seconds: u64) -> Result<Self> {
+    async fn new(data_source: Arc<dyn TuiDataSource>, refresh_seconds: u64) -> Result<Self> {
         let event_loader = spawn_event_loader(Arc::clone(&data_source));
         let chart_loader = spawn_chart_loader(Arc::clone(&data_source));
         let mut app = Self {
@@ -211,12 +209,12 @@ impl App {
             event_loader,
             chart_loader,
         };
-        app.reload(true)?;
+        app.reload(true).await?;
         Ok(app)
     }
 
-    fn reload(&mut self, force: bool) -> Result<()> {
-        let state = self.data_source.load_state()?;
+    async fn reload(&mut self, force: bool) -> Result<()> {
+        let state = self.data_source.load_state().await?;
         let current_snapshot_id = state.latest_snapshot_id;
         if !force && current_snapshot_id == self.latest_snapshot_id {
             return Ok(());
@@ -224,7 +222,7 @@ impl App {
         self.latest_snapshot_id = current_snapshot_id;
         self.leaderboard = state.leaderboard;
         self.apply_filter();
-        self.schedule_dependent_loads()?;
+        self.schedule_dependent_loads().await?;
         self.last_refresh = Instant::now();
         self.status = format!(
             "snapshot={} teams={} compare={}",
@@ -235,21 +233,21 @@ impl App {
         Ok(())
     }
 
-    fn schedule_dependent_loads(&mut self) -> Result<()> {
-        self.schedule_event_refresh()?;
-        self.schedule_chart_reload()?;
+    async fn schedule_dependent_loads(&mut self) -> Result<()> {
+        self.schedule_event_refresh().await?;
+        self.schedule_chart_reload().await?;
         Ok(())
     }
 
-    fn schedule_selection_loads(&mut self) -> Result<()> {
-        self.schedule_event_refresh()?;
+    async fn schedule_selection_loads(&mut self) -> Result<()> {
+        self.schedule_event_refresh().await?;
         if self.compare_teams.is_empty() {
-            self.schedule_chart_reload()?;
+            self.schedule_chart_reload().await?;
         }
         Ok(())
     }
 
-    fn schedule_event_refresh(&mut self) -> Result<()> {
+    async fn schedule_event_refresh(&mut self) -> Result<()> {
         let selected_team = self.selected_team.clone();
         let request_id = self.event_loader.issue_request_id();
         self.events_loading = true;
@@ -265,7 +263,7 @@ impl App {
         Ok(())
     }
 
-    fn schedule_chart_reload(&mut self) -> Result<()> {
+    async fn schedule_chart_reload(&mut self) -> Result<()> {
         let team_ids = self.chart_team_ids();
         let request_id = self.chart_loader.issue_request_id();
         self.chart_loading = !team_ids.is_empty();
@@ -292,12 +290,12 @@ impl App {
         }
     }
 
-    fn poll_async_updates(&mut self) {
-        self.poll_event_updates();
-        self.poll_chart_updates();
+    async fn poll_async_updates(&mut self) {
+        self.poll_event_updates().await;
+        self.poll_chart_updates().await;
     }
 
-    fn poll_event_updates(&mut self) {
+    async fn poll_event_updates(&mut self) {
         loop {
             match self.event_loader.rx.try_recv() {
                 Ok(response) => {
@@ -317,8 +315,8 @@ impl App {
                         }
                     }
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
                     self.events_loading = false;
                     self.status = "event loader disconnected".to_string();
                     break;
@@ -327,7 +325,7 @@ impl App {
         }
     }
 
-    fn poll_chart_updates(&mut self) {
+    async fn poll_chart_updates(&mut self) {
         loop {
             match self.chart_loader.rx.try_recv() {
                 Ok(response) => {
@@ -345,8 +343,8 @@ impl App {
                         }
                     }
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
                     self.chart_loading = false;
                     self.status = "chart loader disconnected".to_string();
                     break;
@@ -390,7 +388,7 @@ impl App {
         }
     }
 
-    fn move_selection(&mut self, delta: isize) -> Result<()> {
+    async fn move_selection(&mut self, delta: isize) -> Result<()> {
         if self.filtered_indices.is_empty() {
             return Ok(());
         }
@@ -399,18 +397,18 @@ impl App {
         let next = min(max(current + delta, 0), len - 1) as usize;
         self.table_state.select(Some(next));
         self.sync_selected_team();
-        self.schedule_selection_loads()?;
+        self.schedule_selection_loads().await?;
         Ok(())
     }
 
-    fn set_selection(&mut self, selected: usize) -> Result<()> {
+    async fn set_selection(&mut self, selected: usize) -> Result<()> {
         if self.filtered_indices.is_empty() {
             return Ok(());
         }
         let next = selected.min(self.filtered_indices.len().saturating_sub(1));
         self.table_state.select(Some(next));
         self.sync_selected_team();
-        self.schedule_selection_loads()?;
+        self.schedule_selection_loads().await?;
         Ok(())
     }
 
@@ -450,7 +448,7 @@ impl App {
         self.event_scroll = next;
     }
 
-    fn toggle_compare(&mut self) -> Result<()> {
+    async fn toggle_compare(&mut self) -> Result<()> {
         let Some(team_id) = self.selected_team.clone() else {
             return Ok(());
         };
@@ -458,13 +456,13 @@ impl App {
             self.compare_teams.remove(&team_id);
         }
         if !self.filtered_indices.is_empty() {
-            self.move_selection(1)?;
+            self.move_selection(1).await?;
             self.ensure_selection_visible();
         } else {
-            self.schedule_selection_loads()?;
+            self.schedule_selection_loads().await?;
         }
         if !self.compare_teams.is_empty() {
-            self.schedule_chart_reload()?;
+            self.schedule_chart_reload().await?;
         }
         Ok(())
     }
@@ -477,36 +475,36 @@ impl App {
         };
     }
 
-    fn clear_search(&mut self) -> Result<()> {
+    async fn clear_search(&mut self) -> Result<()> {
         let preserve_team = self.selected_team.clone();
         self.search_mode = false;
         self.search_input.clear();
         self.apply_filter();
         if let Some(team_id) = preserve_team {
-            self.select_team_by_id(&team_id)?;
+            self.select_team_by_id(&team_id).await?;
         } else {
-            self.schedule_dependent_loads()?;
+            self.schedule_dependent_loads().await?;
         }
         Ok(())
     }
 
-    fn select_team_by_id(&mut self, team_id: &str) -> Result<()> {
+    async fn select_team_by_id(&mut self, team_id: &str) -> Result<()> {
         if let Some(selected) = self
             .filtered_indices
             .iter()
             .position(|idx| self.leaderboard[*idx].team_id == team_id)
         {
-            self.set_selection(selected)?;
+            self.set_selection(selected).await?;
             self.ensure_selection_visible();
         }
         Ok(())
     }
 
-    fn jump_to_top(&mut self) -> Result<()> {
+    async fn jump_to_top(&mut self) -> Result<()> {
         match self.focus {
             Focus::Table => {
                 self.table_scroll = 0;
-                self.set_selection(0)?;
+                self.set_selection(0).await?;
             }
             Focus::Events => {
                 self.event_scroll = 0;
@@ -516,11 +514,11 @@ impl App {
         Ok(())
     }
 
-    fn jump_to_bottom(&mut self) -> Result<()> {
+    async fn jump_to_bottom(&mut self) -> Result<()> {
         match self.focus {
             Focus::Table => {
                 let last = self.filtered_indices.len().saturating_sub(1);
-                self.set_selection(last)?;
+                self.set_selection(last).await?;
                 self.ensure_selection_visible();
             }
             Focus::Events => {
@@ -531,11 +529,11 @@ impl App {
         Ok(())
     }
 
-    fn page_by(&mut self, delta: isize) -> Result<()> {
+    async fn page_by(&mut self, delta: isize) -> Result<()> {
         match self.focus {
             Focus::Table => {
                 let step = self.table_page_capacity() as isize;
-                self.move_selection(delta * step)?;
+                self.move_selection(delta * step).await?;
                 self.ensure_selection_visible();
             }
             Focus::Events => {
@@ -589,13 +587,13 @@ impl App {
         };
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+    async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
         let layout = current_view_layout(self.chart_fullscreen, self.event_fullscreen)?;
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 if contains(layout.table, mouse.column, mouse.row) {
                     self.focus = Focus::Table;
-                    self.move_selection(-1)?;
+                    self.move_selection(-1).await?;
                     self.ensure_selection_visible();
                 } else if contains(layout.events, mouse.column, mouse.row) {
                     self.focus = Focus::Events;
@@ -605,7 +603,7 @@ impl App {
             MouseEventKind::ScrollDown => {
                 if contains(layout.table, mouse.column, mouse.row) {
                     self.focus = Focus::Table;
-                    self.move_selection(1)?;
+                    self.move_selection(1).await?;
                     self.ensure_selection_visible();
                 } else if contains(layout.events, mouse.column, mouse.row) {
                     self.focus = Focus::Events;
@@ -619,11 +617,11 @@ impl App {
                         table_index_from_mouse(layout.table, mouse.row, self.table_scroll)
                         && clicked < self.filtered_indices.len()
                     {
-                        self.set_selection(clicked)?;
+                        self.set_selection(clicked).await?;
                         self.ensure_selection_visible();
                         let team_id = self.selected_team.clone();
                         if self.is_double_click(Focus::Table, team_id.as_deref()) {
-                            self.toggle_compare()?;
+                            self.toggle_compare().await?;
                             self.status = format!(
                                 "toggled compare for {}",
                                 team_id.unwrap_or_else(|| "-".to_string())
@@ -670,10 +668,10 @@ impl App {
 fn spawn_event_loader(
     data_source: Arc<dyn TuiDataSource>,
 ) -> LoaderState<EventLoadRequest, EventLoadResponse> {
-    let (tx, rx_commands) = mpsc::channel::<LoaderCommand<EventLoadRequest>>();
-    let (tx_results, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        while let Ok(command) = rx_commands.recv() {
+    let (tx, mut rx_commands) = mpsc::unbounded_channel::<LoaderCommand<EventLoadRequest>>();
+    let (tx_results, rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        while let Some(command) = rx_commands.recv().await {
             match command {
                 LoaderCommand::Load(mut request) => {
                     while let Ok(next_command) = rx_commands.try_recv() {
@@ -684,6 +682,7 @@ fn spawn_event_loader(
                     }
                     let result = data_source
                         .load_events(request.team_filter.as_deref(), RECENT_EVENTS_LIMIT)
+                        .await
                         .map_err(|error| error.to_string());
                     if tx_results
                         .send(EventLoadResponse {
@@ -703,7 +702,7 @@ fn spawn_event_loader(
     LoaderState {
         tx,
         rx,
-        handle: Some(handle),
+        handle,
         next_request_id: 0,
         latest_request_id: 0,
     }
@@ -712,10 +711,10 @@ fn spawn_event_loader(
 fn spawn_chart_loader(
     data_source: Arc<dyn TuiDataSource>,
 ) -> LoaderState<ChartLoadRequest, ChartLoadResponse> {
-    let (tx, rx_commands) = mpsc::channel::<LoaderCommand<ChartLoadRequest>>();
-    let (tx_results, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        while let Ok(command) = rx_commands.recv() {
+    let (tx, mut rx_commands) = mpsc::unbounded_channel::<LoaderCommand<ChartLoadRequest>>();
+    let (tx_results, rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        while let Some(command) = rx_commands.recv().await {
             match command {
                 LoaderCommand::Load(mut request) => {
                     while let Ok(next_command) = rx_commands.try_recv() {
@@ -726,6 +725,7 @@ fn spawn_chart_loader(
                     }
                     let result = data_source
                         .load_chart(&request.team_ids)
+                        .await
                         .map_err(|error| error.to_string());
                     if tx_results
                         .send(ChartLoadResponse {
@@ -745,128 +745,138 @@ fn spawn_chart_loader(
     LoaderState {
         tx,
         rx,
-        handle: Some(handle),
+        handle,
         next_request_id: 0,
         latest_request_id: 0,
     }
 }
 
-fn run_app(
+async fn run_app(
     mut terminal: DefaultTerminal,
     data_source: Arc<dyn TuiDataSource>,
     refresh_seconds: u64,
 ) -> Result<()> {
-    let mut app = App::new(data_source, refresh_seconds)?;
+    let mut app = App::new(data_source, refresh_seconds).await?;
+    let mut reader = EventStream::new();
 
     loop {
-        app.poll_async_updates();
+        app.poll_async_updates().await;
         terminal.draw(|frame| render(frame, &app))?;
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if app.show_help {
-                        app.handle_help_key(key);
-                        continue;
-                    }
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    if app.search_mode {
+
+        let refresh = tokio::time::sleep(Duration::from_millis(200));
+        tokio::pin!(refresh);
+
+        tokio::select! {
+            maybe_event = reader.next() => {
+                match maybe_event {
+                    Some(Ok(Event::Key(key))) => {
+                        if app.show_help {
+                            app.handle_help_key(key);
+                            continue;
+                        }
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        if app.search_mode {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.clear_search().await?;
+                                }
+                                KeyCode::Enter => {
+                                    app.search_mode = false;
+                                    app.apply_filter();
+                                    app.schedule_selection_loads().await?;
+                                }
+                                KeyCode::Backspace => {
+                                    app.search_input.pop();
+                                    app.apply_filter();
+                                }
+                                KeyCode::Char(c) => {
+                                    app.search_input.push(c);
+                                    app.apply_filter();
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
                         match key.code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Char('r') => app.reload(true).await?,
                             KeyCode::Esc => {
-                                app.clear_search()?;
+                                if app.chart_fullscreen {
+                                    app.chart_fullscreen = false;
+                                    app.focus = Focus::Table;
+                                } else if app.event_fullscreen {
+                                    app.event_fullscreen = false;
+                                    app.focus = Focus::Table;
+                                } else if !app.search_input.is_empty() {
+                                    app.clear_search().await?;
+                                }
                             }
+                            KeyCode::Char('/') => {
+                                app.search_mode = true;
+                                app.status = "search mode".to_string();
+                            }
+                            KeyCode::Char('g') => app.jump_to_top().await?,
+                            KeyCode::Char('G') => app.jump_to_bottom().await?,
+                            KeyCode::Char('[') => app.page_by(-1).await?,
+                            KeyCode::Char(']') => app.page_by(1).await?,
+                            KeyCode::Char('o') => app.toggle_chart_fullscreen(),
+                            KeyCode::Char('O') => app.toggle_event_fullscreen(),
+                            KeyCode::Char('t') => app.toggle_chart_mode(),
+                            KeyCode::Char('h') | KeyCode::Char('?') => app.toggle_help(),
+                            KeyCode::Tab => app.cycle_focus(),
+                            KeyCode::Char('J') => app.scroll_events(1),
+                            KeyCode::Char('K') => app.scroll_events(-1),
+                            KeyCode::Down | KeyCode::Char('j') => match app.focus {
+                                Focus::Table => {
+                                    app.move_selection(1).await?;
+                                    app.ensure_selection_visible();
+                                }
+                                Focus::Events => app.scroll_events(1),
+                                Focus::Chart => {}
+                            },
+                            KeyCode::Up | KeyCode::Char('k') => match app.focus {
+                                Focus::Table => {
+                                    app.move_selection(-1).await?;
+                                    app.ensure_selection_visible();
+                                }
+                                Focus::Events => app.scroll_events(-1),
+                                Focus::Chart => {}
+                            },
                             KeyCode::Enter => {
-                                app.search_mode = false;
-                                app.apply_filter();
-                                app.schedule_selection_loads()?;
+                                app.schedule_event_refresh().await?;
                             }
-                            KeyCode::Backspace => {
-                                app.search_input.pop();
-                                app.apply_filter();
-                            }
-                            KeyCode::Char(c) => {
-                                app.search_input.push(c);
-                                app.apply_filter();
-                            }
+                            KeyCode::Char(' ') => app.toggle_compare().await?,
                             _ => {}
                         }
-                        continue;
                     }
-                    match key.code {
-                        KeyCode::Char('q') => break,
-                        KeyCode::Char('r') => app.reload(true)?,
-                        KeyCode::Esc => {
-                            if app.chart_fullscreen {
-                                app.chart_fullscreen = false;
-                                app.focus = Focus::Table;
-                            } else if app.event_fullscreen {
-                                app.event_fullscreen = false;
-                                app.focus = Focus::Table;
-                            } else if !app.search_input.is_empty() {
-                                app.clear_search()?;
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        if app.show_help {
+                            match mouse.kind {
+                                MouseEventKind::Moved
+                                | MouseEventKind::ScrollUp
+                                | MouseEventKind::ScrollDown
+                                | MouseEventKind::ScrollLeft
+                                | MouseEventKind::ScrollRight => {}
+                                _ => app.toggle_help(),
                             }
+                            continue;
                         }
-                        KeyCode::Char('/') => {
-                            app.search_mode = true;
-                            app.status = "search mode".to_string();
-                        }
-                        KeyCode::Char('g') => app.jump_to_top()?,
-                        KeyCode::Char('G') => app.jump_to_bottom()?,
-                        KeyCode::Char('[') => app.page_by(-1)?,
-                        KeyCode::Char(']') => app.page_by(1)?,
-                        KeyCode::Char('o') => app.toggle_chart_fullscreen(),
-                        KeyCode::Char('O') => app.toggle_event_fullscreen(),
-                        KeyCode::Char('t') => app.toggle_chart_mode(),
-                        KeyCode::Char('h') | KeyCode::Char('?') => app.toggle_help(),
-                        KeyCode::Tab => app.cycle_focus(),
-                        KeyCode::Char('J') => app.scroll_events(1),
-                        KeyCode::Char('K') => app.scroll_events(-1),
-                        KeyCode::Down | KeyCode::Char('j') => match app.focus {
-                            Focus::Table => {
-                                app.move_selection(1)?;
-                                app.ensure_selection_visible();
-                            }
-                            Focus::Events => app.scroll_events(1),
-                            Focus::Chart => {}
-                        },
-                        KeyCode::Up | KeyCode::Char('k') => match app.focus {
-                            Focus::Table => {
-                                app.move_selection(-1)?;
-                                app.ensure_selection_visible();
-                            }
-                            Focus::Events => app.scroll_events(-1),
-                            Focus::Chart => {}
-                        },
-                        KeyCode::Enter => {
-                            app.schedule_event_refresh()?;
-                        }
-                        KeyCode::Char(' ') => app.toggle_compare()?,
-                        _ => {}
+                        app.handle_mouse(mouse).await?;
                     }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error.into()),
+                    None => break,
                 }
-                Event::Mouse(mouse) => {
-                    if app.show_help {
-                        match mouse.kind {
-                            MouseEventKind::Moved
-                            | MouseEventKind::ScrollUp
-                            | MouseEventKind::ScrollDown
-                            | MouseEventKind::ScrollLeft
-                            | MouseEventKind::ScrollRight => {}
-                            _ => app.toggle_help(),
-                        }
-                        continue;
-                    }
-                    app.handle_mouse(mouse)?;
-                }
-                _ => {}
             }
+            _ = &mut refresh => {}
         }
 
-        app.poll_async_updates();
+        app.poll_async_updates().await;
 
         if app.last_refresh.elapsed() >= app.refresh_every {
-            app.reload(false)?;
+            app.reload(false).await?;
         }
     }
 
@@ -1242,49 +1252,60 @@ fn split_layout(area: Rect, chart_fullscreen: bool, event_fullscreen: bool) -> V
             .constraints([Constraint::Min(1), Constraint::Length(3)])
             .split(area);
         return ViewLayout {
-            table: Rect::new(0, 0, 0, 0),
-            events: Rect::new(0, 0, 0, 0),
+            table: Rect::default(),
+            events: Rect::default(),
             chart: layout[0],
             status: layout[1],
         };
     }
+
     if event_fullscreen {
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(3)])
             .split(area);
         return ViewLayout {
-            table: Rect::new(0, 0, 0, 0),
+            table: Rect::default(),
             events: layout[0],
-            chart: Rect::new(0, 0, 0, 0),
+            chart: Rect::default(),
             status: layout[1],
         };
     }
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(58),
-            Constraint::Percentage(37),
+            Constraint::Min(10),
+            Constraint::Min(8),
+            Constraint::Min(10),
             Constraint::Length(3),
         ])
         .split(area);
-    let bottom = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(layout[1]);
     ViewLayout {
         table: layout[0],
-        events: bottom[0],
-        chart: bottom[1],
-        status: layout[2],
+        events: layout[1],
+        chart: layout[2],
+        status: layout[3],
     }
 }
 
-fn contains(rect: Rect, column: u16, row: u16) -> bool {
-    column >= rect.x
-        && column < rect.x.saturating_add(rect.width)
-        && row >= rect.y
-        && row < rect.y.saturating_add(rect.height)
+fn border_style(active: bool) -> Style {
+    if active {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn contains(area: Rect, column: u16, row: u16) -> bool {
+    area.contains((column, row).into())
+}
+
+fn table_index_from_mouse(area: Rect, row: u16, scroll: usize) -> Option<usize> {
+    if row <= area.y + 1 || row >= area.bottom().saturating_sub(1) {
+        return None;
+    }
+    Some(scroll + (row - area.y - 2) as usize)
 }
 
 fn table_visible_rows(area: Rect) -> usize {
@@ -1295,74 +1316,29 @@ fn events_visible_rows(area: Rect) -> usize {
     area.height.saturating_sub(2) as usize
 }
 
-fn table_index_from_mouse(area: Rect, row: u16, scroll: usize) -> Option<usize> {
-    let data_start = area.y.saturating_add(2);
-    if row < data_start || row >= area.y.saturating_add(area.height.saturating_sub(1)) {
-        return None;
-    }
-    Some(scroll + (row - data_start) as usize)
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    let horizontal = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1]);
-    horizontal[1]
-}
-
-fn border_style(active: bool) -> Style {
-    if active {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    }
-}
-
 fn format_rank_delta(delta: Option<i64>) -> String {
     match delta {
-        Some(value) if value > 0 => format!("↑{}", value),
-        Some(value) if value < 0 => format!("↓{}", value.abs()),
-        Some(_) => "-".to_string(),
+        Some(value) if value > 0 => format!("+{}", value),
+        Some(value) => value.to_string(),
         None => "-".to_string(),
+    }
+}
+
+fn format_score_delta(delta: f64) -> String {
+    if delta >= 0.0 {
+        format!("+{:.4}", delta)
+    } else {
+        format!("{:.4}", delta)
     }
 }
 
 fn rank_delta_style(is_new: bool, delta: Option<i64>) -> Style {
     if is_new {
-        return Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD);
-    }
-
-    match delta {
-        Some(value) if value > 0 => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-        Some(value) if value < 0 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(Color::DarkGray),
-    }
-}
-
-fn format_score_delta(delta: f64) -> String {
-    if delta > 0.0 {
-        format!("+{delta:.4}")
-    } else if delta < 0.0 {
-        format!("{delta:.4}")
+        Style::default().fg(Color::Green)
+    } else if delta.unwrap_or_default() < 0 {
+        Style::default().fg(Color::Red)
     } else {
-        "-".to_string()
+        Style::default().fg(Color::Yellow)
     }
 }
 
@@ -1370,57 +1346,49 @@ fn score_delta_style(delta: Option<f64>) -> Style {
     match delta {
         Some(value) if value > 0.0 => Style::default().fg(Color::Green),
         Some(value) if value < 0.0 => Style::default().fg(Color::Red),
-        _ => Style::default().fg(Color::DarkGray),
+        Some(_) => Style::default().fg(Color::Yellow),
+        None => Style::default().fg(Color::DarkGray),
     }
 }
 
-fn format_timestamp(input: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(input)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|_| input.to_string())
+fn format_timestamp(timestamp: &str) -> String {
+    timestamp.to_string()
 }
 
 fn format_timestamp_short_unix(timestamp: i64) -> String {
-    chrono::DateTime::from_timestamp(timestamp, 0)
-        .map(|dt| dt.format("%m-%d %H:%M").to_string())
-        .unwrap_or_else(|| timestamp.to_string())
-}
-
-fn format_event(event: &EventViewRow) -> String {
-    let rank = match (event.old_rank, event.new_rank) {
-        (Some(old_rank), Some(new_rank)) => format!("rank {old_rank}->{new_rank}"),
-        (Some(old_rank), None) => format!("rank {old_rank}->OUT"),
-        (None, Some(new_rank)) => format!("rank NEW->{new_rank}"),
-        (None, None) => "-".to_string(),
-    };
-    let score = match (event.old_score, event.new_score) {
-        (Some(old_score), Some(new_score)) => format!("score {old_score:.4}->{new_score:.4}"),
-        (Some(old_score), None) => format!("score {old_score:.4}->OUT"),
-        (None, Some(new_score)) => format!("score NEW->{new_score:.4}"),
-        (None, None) => "-".to_string(),
-    };
-    let version = match (&event.old_version, &event.new_version) {
-        (Some(old_version), Some(new_version)) if old_version != new_version => {
-            format!("version {old_version}->{new_version}")
-        }
-        (None, Some(new_version)) => format!("version NEW->{new_version}"),
-        (Some(old_version), None) => format!("version {old_version}->OUT"),
-        _ => "-".to_string(),
-    };
-    format!(
-        "{} {} {} | {} | {} | {}",
-        format_timestamp(&event.fetched_at),
-        event.team_id,
-        event.event_type,
-        rank,
-        score,
-        version
-    )
+    timestamp.to_string()
 }
 
 fn format_chart_value(mode: ChartMode, value: f64) -> String {
     match mode {
-        ChartMode::Score => format!("{value:.3}"),
+        ChartMode::Score => format!("{:.2}", value),
         ChartMode::Rank => format!("{:.0}", value),
     }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+fn format_event(event: &EventViewRow) -> String {
+    format!(
+        "{} {} {}",
+        event.fetched_at, event.team_id, event.event_type
+    )
 }

@@ -16,9 +16,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::runtime::Builder;
 use tokio::task;
-use tracing::{error, info, Instrument};
+use tracing::{Instrument, error, info};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::cli::{Cli, Command, DummyArgs};
@@ -28,29 +27,23 @@ use crate::diff::diff_rows;
 use crate::fetch::fetch_leaderboard;
 use crate::notify::{MailNotifier, NoopNotifier, Notifier};
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let resolved_command = cli
         .command
         .clone()
         .unwrap_or(Command::Tui(Default::default()));
-    let loaded = LoadedConfig::load(&cli)?;
+    let loaded = LoadedConfig::load(&cli).await?;
     let command_summary = loaded.config.redacted_command_summary(&resolved_command);
 
     info!(command = %command_summary, "starting lb-monitor");
     match resolved_command {
-        Command::Tui(_) => tui::run(&loaded.config),
-        Command::Serve(args) => build_runtime()?.block_on(serve(&loaded.config, args.once)),
-        Command::Dummy(args) => dummy(&loaded.config, &args),
+        Command::Tui(_) => tui::run(&loaded.config).await,
+        Command::Serve(args) => serve(&loaded.config, args.once).await,
+        Command::Dummy(args) => dummy(&loaded.config, &args).await,
     }
-}
-
-fn build_runtime() -> Result<tokio::runtime::Runtime> {
-    Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to build tokio runtime")
 }
 
 #[tracing::instrument(skip(config))]
@@ -135,26 +128,32 @@ async fn run_fetch_cycle(
 ) -> Result<bool> {
     let page = fetch_leaderboard(&url).await?;
     let span = tracing::Span::current();
-    task::spawn_blocking(move || {
+    let notification = task::spawn_blocking(move || {
         let _entered = span.enter();
-        run_fetch_cycle_blocking(&db_path, page, notifier.as_ref())
+        run_fetch_cycle_blocking(&db_path, page)
     })
     .await
-    .context("fetch cycle task join failed")?
+    .context("fetch cycle task join failed")??;
+
+    let Some((subject, body)) = notification else {
+        return Ok(false);
+    };
+
+    notifier.notify_update(&subject, &body).await?;
+    Ok(true)
 }
 
-#[tracing::instrument(skip(db_path, page, notifier))]
+#[tracing::instrument(skip(db_path, page))]
 fn run_fetch_cycle_blocking(
     db_path: &Path,
     page: crate::parse::LeaderboardPage,
-    notifier: &dyn Notifier,
-) -> Result<bool> {
+) -> Result<Option<(String, String)>> {
     let mut conn = open_rw(db_path)?;
     let previous = previous_snapshot_rows(&conn)?;
     let diff = diff_rows(&previous, &page.rows, page.source_updated_at.as_deref());
 
     if !diff.changed {
-        return Ok(false);
+        return Ok(None);
     }
 
     let is_initial_snapshot = previous.is_empty();
@@ -171,7 +170,6 @@ fn run_fetch_cycle_blocking(
         page.rows.len(),
         &diff.events,
     );
-    notifier.notify_update(&subject, &body)?;
     if is_initial_snapshot {
         info!(
             teams = page.rows.len(),
@@ -181,12 +179,10 @@ fn run_fetch_cycle_blocking(
         info!(changes = diff.events.len(), "leaderboard updated");
     }
 
-    Ok(true)
+    Ok(Some((subject, body)))
 }
 
-fn log_fetch_cycle_result(
-    result: Result<bool>,
-) -> Result<()> {
+fn log_fetch_cycle_result(result: Result<bool>) -> Result<()> {
     match result {
         Ok(_) => Ok(()),
         Err(error) => {
@@ -291,9 +287,16 @@ fn format_event_lines(events: &[crate::diff::TeamEvent]) -> Vec<String> {
         .collect()
 }
 
-fn dummy(config: &config::Config, args: &DummyArgs) -> Result<()> {
-    let mut conn = open_rw(&config.database.path)?;
-    replace_with_dummy_data(&mut conn, args.snapshots, args.teams)?;
+async fn dummy(config: &config::Config, args: &DummyArgs) -> Result<()> {
+    let db_path = config.database.path.clone();
+    let snapshots = args.snapshots;
+    let teams = args.teams;
+    task::spawn_blocking(move || {
+        let mut conn = open_rw(&db_path)?;
+        replace_with_dummy_data(&mut conn, snapshots, teams)
+    })
+    .await
+    .context("dummy generation task join failed")??;
     info!(
         snapshots = args.snapshots,
         teams = args.teams,
@@ -323,7 +326,8 @@ async fn shutdown_signal() -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut sigint = signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
-    let mut sigterm = signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
+    let mut sigterm =
+        signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
 
     tokio::select! {
         _ = sigint.recv() => {}

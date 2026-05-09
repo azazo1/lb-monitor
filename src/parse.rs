@@ -174,10 +174,8 @@ fn parse_bundle_rows(bundle: &str) -> Vec<LeaderboardRow> {
 
 fn extract_leaderboard_array(bundle: &str) -> Option<String> {
     let array_regex = Regex::new(r#"const\s+[A-Za-z0-9_$]+\s*=\s*\[(?s)(.*?)\];"#).ok()?;
-    let row_regex = Regex::new(
-        r#"\{rank:\d+,team:"[^"]+",score:[0-9.]+,version:"[^"]+"\}"#,
-    )
-    .ok()?;
+    let row_regex =
+        Regex::new(r#"\{rank:\d+,team:"[^"]+",score:[0-9.]+,version:"[^"]+"\}"#).ok()?;
 
     array_regex.captures_iter(bundle).find_map(|captures| {
         let candidate = captures.get(1)?.as_str();
@@ -267,7 +265,7 @@ Latest update: May 9, 2026
 
         assert_eq!(
             extract_bundle_path(html).as_deref(),
-            Some("/assets/index-CYRVxih_.js")
+            Some("/assets/index-CtkcNCSf.js")
         );
 
         let parsed = parse_leaderboard_bundle(bundle).expect("parse leaderboard bundle");

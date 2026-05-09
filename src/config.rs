@@ -1,8 +1,8 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use tokio::fs;
 use tracing::warn;
 
 use crate::cli::{Cli, Command, ServeArgs, TuiArgs};
@@ -184,9 +184,9 @@ impl Default for Config {
 }
 
 impl LoadedConfig {
-    pub fn load(cli: &Cli) -> Result<Self> {
+    pub async fn load(cli: &Cli) -> Result<Self> {
         let config_path = cli.config.clone().unwrap_or_else(default_config_path);
-        let mut file_config = load_file_config(&config_path)?;
+        let mut file_config = load_file_config(&config_path).await?;
         expand_file_config_paths(&mut file_config)?;
         let mut config = Config::default();
         let mut tui_source_explicit = false;
@@ -467,16 +467,20 @@ fn redact_vec(values: &[String]) -> String {
     }
 }
 
-fn load_file_config(path: &Path) -> Result<FileConfig> {
-    if !path.exists() {
-        warn!(path = %path.display(), "config does not exist, use default config instead");
-        return Ok(FileConfig::default());
+async fn load_file_config(path: &Path) -> Result<FileConfig> {
+    let exists = fs::try_exists(path)
+        .await
+        .with_context(|| format!("failed to check config file {}", path.display()))?;
+    if exists {
+        let contents = fs::read_to_string(path)
+            .await
+            .with_context(|| format!("failed to read config file {}", path.display()))?;
+        return toml::from_str(&contents)
+            .with_context(|| format!("failed to parse config file {}", path.display()));
     }
 
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read config file {}", path.display()))?;
-    toml::from_str(&contents)
-        .with_context(|| format!("failed to parse config file {}", path.display()))
+    warn!(path = %path.display(), "config does not exist, use default config instead");
+    Ok(FileConfig::default())
 }
 
 #[cfg(test)]
@@ -492,19 +496,19 @@ mod tests {
             .join("missing-config.toml")
     }
 
-    #[test]
-    fn tui_defaults_to_local_sqlite() {
+    #[tokio::test]
+    async fn tui_defaults_to_local_sqlite() {
         let cli = Cli {
             config: Some(missing_config_path()),
             db: None,
             command: Some(Command::Tui(TuiArgs::default())),
         };
-        let loaded = LoadedConfig::load(&cli).expect("load config");
+        let loaded = LoadedConfig::load(&cli).await.expect("load config");
         assert!(matches!(loaded.config.tui.source, TuiSource::LocalSqlite));
     }
 
-    #[test]
-    fn tui_switches_to_remote_when_api_base_url_is_set() {
+    #[tokio::test]
+    async fn tui_switches_to_remote_when_api_base_url_is_set() {
         let cli = Cli {
             config: Some(missing_config_path()),
             db: None,
@@ -514,13 +518,13 @@ mod tests {
                 api_base_url: Some("https://example.com".to_string()),
             })),
         };
-        let loaded = LoadedConfig::load(&cli).expect("load config");
+        let loaded = LoadedConfig::load(&cli).await.expect("load config");
         assert!(matches!(loaded.config.tui.source, TuiSource::RemoteApi));
         assert_eq!(loaded.config.tui.api_base_url, "https://example.com");
     }
 
-    #[test]
-    fn explicit_sqlite_source_keeps_local_reads() {
+    #[tokio::test]
+    async fn explicit_sqlite_source_keeps_local_reads() {
         let cli = Cli {
             config: Some(missing_config_path()),
             db: None,
@@ -530,16 +534,16 @@ mod tests {
                 api_base_url: Some("https://example.com".to_string()),
             })),
         };
-        let loaded = LoadedConfig::load(&cli).expect("load config");
+        let loaded = LoadedConfig::load(&cli).await.expect("load config");
         assert!(matches!(loaded.config.tui.source, TuiSource::LocalSqlite));
         assert_eq!(loaded.config.tui.api_base_url, "https://example.com");
     }
 
-    #[test]
-    fn loads_grouped_serve_and_tui_sections() {
+    #[tokio::test]
+    async fn loads_grouped_serve_and_tui_sections() {
         let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("lb-monitor.toml");
-        fs::write(
+        std::fs::write(
             &config_path,
             r#"
 [database]
@@ -576,7 +580,7 @@ database_path = "tui.sqlite3"
             db: None,
             command: Some(Command::Tui(TuiArgs::default())),
         };
-        let loaded = LoadedConfig::load(&cli).expect("load config");
+        let loaded = LoadedConfig::load(&cli).await.expect("load config");
 
         assert_eq!(loaded.config.database.path, PathBuf::from("shared.sqlite3"));
         assert_eq!(
@@ -608,8 +612,8 @@ database_path = "tui.sqlite3"
         );
     }
 
-    #[test]
-    fn redacted_summary_uses_effective_serve_config() {
+    #[tokio::test]
+    async fn redacted_summary_uses_effective_serve_config() {
         let cli = Cli {
             config: Some(missing_config_path()),
             db: None,
@@ -628,7 +632,7 @@ database_path = "tui.sqlite3"
                 smtp_security: None,
             })),
         };
-        let loaded = LoadedConfig::load(&cli).expect("load config");
+        let loaded = LoadedConfig::load(&cli).await.expect("load config");
         let summary = loaded
             .config
             .redacted_command_summary(cli.command.as_ref().expect("command"));

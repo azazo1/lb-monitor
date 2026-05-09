@@ -1,16 +1,18 @@
 use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
 use lettre::message::{Mailbox, Message};
 use lettre::transport::smtp::authentication::Credentials;
-use lettre::{SmtpTransport, Transport};
+use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 
 use crate::config::{MailConfig, SmtpSecurity};
 
+#[async_trait]
 pub trait Notifier: Send + Sync {
-    fn notify_update(&self, subject: &str, body: &str) -> Result<()>;
+    async fn notify_update(&self, subject: &str, body: &str) -> Result<()>;
 }
 
 pub struct MailNotifier {
-    mailer: SmtpTransport,
+    mailer: AsyncSmtpTransport<Tokio1Executor>,
     from: Mailbox,
     to: Vec<Mailbox>,
 }
@@ -45,10 +47,14 @@ impl MailNotifier {
         }
 
         let mut builder = match smtp.security {
-            SmtpSecurity::Plain => SmtpTransport::builder_dangerous(&smtp.host),
-            SmtpSecurity::StartTls => SmtpTransport::starttls_relay(&smtp.host)
-                .with_context(|| format!("failed to build starttls transport for {}", smtp.host))?,
-            SmtpSecurity::Tls => SmtpTransport::relay(&smtp.host)
+            SmtpSecurity::Plain => {
+                AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&smtp.host)
+            }
+            SmtpSecurity::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(
+                &smtp.host,
+            )
+            .with_context(|| format!("failed to build starttls transport for {}", smtp.host))?,
+            SmtpSecurity::Tls => AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.host)
                 .with_context(|| format!("failed to build tls transport for {}", smtp.host))?,
         }
         .port(smtp.port);
@@ -77,20 +83,23 @@ impl MailNotifier {
     }
 }
 
+#[async_trait]
 impl Notifier for MailNotifier {
-    fn notify_update(&self, subject: &str, body: &str) -> Result<()> {
+    async fn notify_update(&self, subject: &str, body: &str) -> Result<()> {
         let span = tracing::info_span!("notify_update", subject = %subject);
         let _entered = span.enter();
         let message = self.build_message(subject, body)?;
         self.mailer
-            .send(&message)
+            .send(message)
+            .await
             .context("failed to send mail notification")?;
         Ok(())
     }
 }
 
+#[async_trait]
 impl Notifier for NoopNotifier {
-    fn notify_update(&self, _subject: &str, _body: &str) -> Result<()> {
+    async fn notify_update(&self, _subject: &str, _body: &str) -> Result<()> {
         let span = tracing::info_span!("noop_notify_update");
         let _entered = span.enter();
         Ok(())
@@ -102,8 +111,8 @@ mod tests {
     use super::*;
     use crate::config::{SmtpConfig, SmtpSecurity};
 
-    #[test]
-    fn builds_mail_for_multiple_recipients() {
+    #[tokio::test]
+    async fn builds_mail_for_multiple_recipients() {
         let notifier = MailNotifier::new(&MailConfig {
             enabled: true,
             smtp: SmtpConfig {
@@ -128,5 +137,6 @@ mod tests {
 
         assert!(formatted.contains("alpha@example.com"));
         assert!(formatted.contains("beta@example.com"));
+        drop(notifier);
     }
 }

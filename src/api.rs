@@ -6,11 +6,11 @@ use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tokio::task::{self, JoinHandle};
+use tokio::task::JoinHandle;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
@@ -45,29 +45,29 @@ impl ApiClient {
         })
     }
 
-    pub fn state(&self) -> Result<ApiState> {
-        self.get_json("/api/v1/state")
+    pub async fn state(&self) -> Result<ApiState> {
+        self.get_json("/api/v1/state").await
     }
 
-    pub fn events(&self, team: Option<&str>, limit: usize) -> Result<Vec<EventViewRow>> {
+    pub async fn events(&self, team: Option<&str>, limit: usize) -> Result<Vec<EventViewRow>> {
         let mut path = format!("/api/v1/events?limit={limit}");
         if let Some(team) = team {
             path.push_str("&team=");
             path.push_str(team);
         }
-        self.get_json(&path)
+        self.get_json(&path).await
     }
 
-    pub fn chart(&self, team_ids: &[String]) -> Result<HashMap<String, Vec<ChartPoint>>> {
+    pub async fn chart(&self, team_ids: &[String]) -> Result<HashMap<String, Vec<ChartPoint>>> {
         let mut path = String::from("/api/v1/chart");
         if !team_ids.is_empty() {
             path.push_str("?team_ids=");
             path.push_str(&team_ids.join(","));
         }
-        self.get_json(&path)
+        self.get_json(&path).await
     }
 
-    fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
+    async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
         let span = tracing::info_span!("api_client_request", url = %url);
         let _entered = span.enter();
@@ -75,10 +75,14 @@ impl ApiClient {
             .client
             .get(&url)
             .send()
-            .and_then(|response| response.error_for_status())
+            .await
+            .with_context(|| format!("failed to fetch {url}"))?;
+        let response = response
+            .error_for_status()
             .with_context(|| format!("failed to fetch {url}"))?;
         response
             .json::<T>()
+            .await
             .with_context(|| format!("failed to decode json from {url}"))
     }
 }
@@ -142,22 +146,20 @@ pub async fn spawn_http_server(db_path: PathBuf, listen: &str) -> Result<ApiServ
 #[tracing::instrument(skip(state))]
 async fn get_state(State(state): State<ApiAppState>) -> Result<Json<ApiState>, ApiError> {
     let db_path = state.db_path.clone();
-    let (snapshot, leaderboard) = run_query(move || {
-        let snapshot = load_snapshot_meta(&db_path)?;
-        let leaderboard = load_leaderboard_state(&db_path, SnapshotPolicy::AllowEmpty)?.leaderboard;
-        Ok((snapshot, leaderboard))
-    })
-    .await?;
+    let (snapshot, leaderboard_state) = tokio::try_join!(
+        load_snapshot_meta(&db_path),
+        load_leaderboard_state(&db_path, SnapshotPolicy::AllowEmpty),
+    )?;
     Ok(Json(ApiState {
         snapshot,
-        leaderboard,
+        leaderboard: leaderboard_state.leaderboard,
     }))
 }
 
 #[tracing::instrument(skip(state))]
 async fn get_snapshot(State(state): State<ApiAppState>) -> Result<Json<SnapshotMeta>, ApiError> {
     let db_path = state.db_path.clone();
-    Ok(Json(run_query(move || load_snapshot_meta(&db_path)).await?))
+    Ok(Json(load_snapshot_meta(&db_path).await?))
 }
 
 #[tracing::instrument(skip(state))]
@@ -165,12 +167,8 @@ async fn get_leaderboard(
     State(state): State<ApiAppState>,
 ) -> Result<Json<Vec<LeaderboardViewRow>>, ApiError> {
     let db_path = state.db_path.clone();
-    Ok(Json(
-        run_query(move || {
-            Ok(load_leaderboard_state(&db_path, SnapshotPolicy::AllowEmpty)?.leaderboard)
-        })
-        .await?,
-    ))
+    let state = load_leaderboard_state(&db_path, SnapshotPolicy::AllowEmpty).await?;
+    Ok(Json(state.leaderboard))
 }
 
 #[tracing::instrument(skip(state))]
@@ -181,14 +179,12 @@ async fn get_events(
     let limit = query.limit.unwrap_or(100);
     let db_path = state.db_path.clone();
     Ok(Json(
-        run_query(move || {
-            load_recent_events(
-                &db_path,
-                query.team.as_deref(),
-                limit,
-                SnapshotPolicy::AllowEmpty,
-            )
-        })
+        load_recent_events(
+            &db_path,
+            query.team.as_deref(),
+            limit,
+            SnapshotPolicy::AllowEmpty,
+        )
         .await?,
     ))
 }
@@ -210,8 +206,7 @@ async fn get_chart(
         .unwrap_or_default();
     let db_path = state.db_path.clone();
     Ok(Json(
-        run_query(move || load_chart_series(&db_path, &team_ids, SnapshotPolicy::AllowEmpty))
-            .await?,
+        load_chart_series(&db_path, &team_ids, SnapshotPolicy::AllowEmpty).await?,
     ))
 }
 
@@ -236,21 +231,6 @@ where
     fn from(error: E) -> Self {
         Self(error.into())
     }
-}
-
-async fn run_query<T, F>(job: F) -> Result<T, ApiError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T> + Send + 'static,
-{
-    let span = tracing::Span::current();
-    task::spawn_blocking(move || {
-        let _entered = span.enter();
-        job()
-    })
-        .await
-        .context("query task join failed")?
-        .map_err(ApiError::from)
 }
 
 impl IntoResponse for ApiError {
