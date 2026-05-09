@@ -1275,37 +1275,36 @@ fn split_layout(area: Rect, chart_fullscreen: bool, event_fullscreen: bool) -> V
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(10),
-            Constraint::Min(8),
-            Constraint::Min(10),
+            Constraint::Percentage(58),
+            Constraint::Percentage(37),
             Constraint::Length(3),
         ])
         .split(area);
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(layout[1]);
     ViewLayout {
         table: layout[0],
-        events: layout[1],
-        chart: layout[2],
-        status: layout[3],
+        events: bottom[0],
+        chart: bottom[1],
+        status: layout[2],
     }
 }
 
 fn border_style(active: bool) -> Style {
     if active {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
     }
 }
 
 fn contains(area: Rect, column: u16, row: u16) -> bool {
-    area.contains((column, row).into())
-}
-
-fn table_index_from_mouse(area: Rect, row: u16, scroll: usize) -> Option<usize> {
-    if row <= area.y + 1 || row >= area.bottom().saturating_sub(1) {
-        return None;
-    }
-    Some(scroll + (row - area.y - 2) as usize)
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
 }
 
 fn table_visible_rows(area: Rect) -> usize {
@@ -1316,29 +1315,46 @@ fn events_visible_rows(area: Rect) -> usize {
     area.height.saturating_sub(2) as usize
 }
 
-fn format_rank_delta(delta: Option<i64>) -> String {
-    match delta {
-        Some(value) if value > 0 => format!("+{}", value),
-        Some(value) => value.to_string(),
-        None => "-".to_string(),
+fn table_index_from_mouse(area: Rect, row: u16, scroll: usize) -> Option<usize> {
+    let data_start = area.y.saturating_add(2);
+    if row < data_start || row >= area.y.saturating_add(area.height.saturating_sub(1)) {
+        return None;
     }
+    Some(scroll + (row - data_start) as usize)
 }
 
-fn format_score_delta(delta: f64) -> String {
-    if delta >= 0.0 {
-        format!("+{:.4}", delta)
-    } else {
-        format!("{:.4}", delta)
+fn format_rank_delta(delta: Option<i64>) -> String {
+    match delta {
+        Some(value) if value > 0 => format!("↑{}", value),
+        Some(value) if value < 0 => format!("↓{}", value.abs()),
+        Some(_) => "-".to_string(),
+        None => "-".to_string(),
     }
 }
 
 fn rank_delta_style(is_new: bool, delta: Option<i64>) -> Style {
     if is_new {
-        Style::default().fg(Color::Green)
-    } else if delta.unwrap_or_default() < 0 {
-        Style::default().fg(Color::Red)
+        return Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+    }
+
+    match delta {
+        Some(value) if value > 0 => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        Some(value) if value < 0 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(Color::DarkGray),
+    }
+}
+
+fn format_score_delta(delta: f64) -> String {
+    if delta > 0.0 {
+        format!("+{delta:.4}")
+    } else if delta < 0.0 {
+        format!("{delta:.4}")
     } else {
-        Style::default().fg(Color::Yellow)
+        "-".to_string()
     }
 }
 
@@ -1346,28 +1362,24 @@ fn score_delta_style(delta: Option<f64>) -> Style {
     match delta {
         Some(value) if value > 0.0 => Style::default().fg(Color::Green),
         Some(value) if value < 0.0 => Style::default().fg(Color::Red),
-        Some(_) => Style::default().fg(Color::Yellow),
-        None => Style::default().fg(Color::DarkGray),
+        _ => Style::default().fg(Color::DarkGray),
     }
 }
 
-fn format_timestamp(timestamp: &str) -> String {
-    timestamp.to_string()
+fn format_timestamp(input: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(input)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|_| input.to_string())
 }
 
 fn format_timestamp_short_unix(timestamp: i64) -> String {
-    timestamp.to_string()
-}
-
-fn format_chart_value(mode: ChartMode, value: f64) -> String {
-    match mode {
-        ChartMode::Score => format!("{:.2}", value),
-        ChartMode::Rank => format!("{:.0}", value),
-    }
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|dt| dt.format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| timestamp.to_string())
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::default()
+    let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage((100 - percent_y) / 2),
@@ -1375,20 +1387,52 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_y) / 2),
         ])
         .split(area);
-
-    Layout::default()
+    let horizontal = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage((100 - percent_x) / 2),
             Constraint::Percentage(percent_x),
             Constraint::Percentage((100 - percent_x) / 2),
         ])
-        .split(popup_layout[1])[1]
+        .split(vertical[1]);
+    horizontal[1]
 }
 
 fn format_event(event: &EventViewRow) -> String {
+    let rank = match (event.old_rank, event.new_rank) {
+        (Some(old_rank), Some(new_rank)) => format!("rank {old_rank}->{new_rank}"),
+        (Some(old_rank), None) => format!("rank {old_rank}->OUT"),
+        (None, Some(new_rank)) => format!("rank NEW->{new_rank}"),
+        (None, None) => "-".to_string(),
+    };
+    let score = match (event.old_score, event.new_score) {
+        (Some(old_score), Some(new_score)) => format!("score {old_score:.4}->{new_score:.4}"),
+        (Some(old_score), None) => format!("score {old_score:.4}->OUT"),
+        (None, Some(new_score)) => format!("score NEW->{new_score:.4}"),
+        (None, None) => "-".to_string(),
+    };
+    let version = match (&event.old_version, &event.new_version) {
+        (Some(old_version), Some(new_version)) if old_version != new_version => {
+            format!("version {old_version}->{new_version}")
+        }
+        (None, Some(new_version)) => format!("version NEW->{new_version}"),
+        (Some(old_version), None) => format!("version {old_version}->OUT"),
+        _ => "-".to_string(),
+    };
     format!(
-        "{} {} {}",
-        event.fetched_at, event.team_id, event.event_type
+        "{} {} {} | {} | {} | {}",
+        format_timestamp(&event.fetched_at),
+        event.team_id,
+        event.event_type,
+        rank,
+        score,
+        version
     )
+}
+
+fn format_chart_value(mode: ChartMode, value: f64) -> String {
+    match mode {
+        ChartMode::Score => format!("{value:.3}"),
+        ChartMode::Rank => format!("{:.0}", value),
+    }
 }
