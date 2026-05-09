@@ -147,11 +147,7 @@ fn parse_text_rows(document: &Html) -> Vec<LeaderboardRow> {
 }
 
 fn parse_bundle_rows(bundle: &str) -> Vec<LeaderboardRow> {
-    let Some(array_match) = Regex::new(r#"const OT=\[(?s)(.*?)\];function"#)
-        .expect("regex")
-        .captures(bundle)
-        .and_then(|captures| captures.get(1).map(|m| m.as_str().to_string()))
-    else {
+    let Some(array_match) = extract_leaderboard_array(bundle) else {
         return Vec::new();
     };
 
@@ -174,6 +170,19 @@ fn parse_bundle_rows(bundle: &str) -> Vec<LeaderboardRow> {
             })
         })
         .collect()
+}
+
+fn extract_leaderboard_array(bundle: &str) -> Option<String> {
+    let array_regex = Regex::new(r#"const\s+[A-Za-z0-9_$]+\s*=\s*\[(?s)(.*?)\];"#).ok()?;
+    let row_regex = Regex::new(
+        r#"\{rank:\d+,team:"[^"]+",score:[0-9.]+,version:"[^"]+"\}"#,
+    )
+    .ok()?;
+
+    array_regex.captures_iter(bundle).find_map(|captures| {
+        let candidate = captures.get(1)?.as_str();
+        row_regex.find(candidate).map(|_| candidate.to_string())
+    })
 }
 
 fn collect_text(document: &Html) -> String {
@@ -247,13 +256,13 @@ Rank Team Score Version
         let html = r#"
 <html>
   <head>
-    <script type="module" crossorigin src="/assets/index-CYRVxih_.js"></script>
+    <script type="module" crossorigin src="/assets/index-CtkcNCSf.js"></script>
   </head>
 </html>
 "#;
         let bundle = r#"
-const OT=[{rank:1,team:"1384",score:.6311,version:"v2"},{rank:2,team:"1227",score:.5906,version:"v3"}];function zT(n){return n.toFixed(4)}
-Latest update: May 7, 2026
+const O8=[{rank:41,team:"1308",score:.4061,version:"v3"},{rank:42,team:"1227",score:.4051,version:"v2"}];const B8=["Rank","Team","Score","Version"]
+Latest update: May 9, 2026
 "#;
 
         assert_eq!(
@@ -262,9 +271,10 @@ Latest update: May 7, 2026
         );
 
         let parsed = parse_leaderboard_bundle(bundle).expect("parse leaderboard bundle");
-        assert_eq!(parsed.source_updated_at.as_deref(), Some("2026-05-07"));
+        assert_eq!(parsed.source_updated_at.as_deref(), Some("2026-05-09"));
         assert_eq!(parsed.rows.len(), 2);
-        assert_eq!(parsed.rows[0].team_id, "1384");
-        assert_eq!(parsed.rows[1].score, 0.5906);
+        assert_eq!(parsed.rows[0].rank, 41);
+        assert_eq!(parsed.rows[0].team_id, "1308");
+        assert_eq!(parsed.rows[1].score, 0.4051);
     }
 }
