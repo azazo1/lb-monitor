@@ -2,12 +2,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use tokio::task;
 
 use crate::db::{
-    ChartPoint, EventViewRow, LeaderboardViewRow, assert_has_snapshots, latest_leaderboard,
-    latest_snapshot_id, open_ro, recent_events, team_chart_series,
+    ChartPoint, EventViewRow, LeaderboardState, SnapshotMeta, assert_has_snapshots,
+    chart_series_to_snapshot, events_for_snapshot, leaderboard_state, open_ro, snapshot_meta,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,30 +15,17 @@ pub enum SnapshotPolicy {
     RequireExisting,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SnapshotMeta {
-    pub latest_snapshot_id: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LeaderboardState {
-    pub latest_snapshot_id: Option<i64>,
-    pub leaderboard: Vec<LeaderboardViewRow>,
-}
-
 pub async fn load_leaderboard_state(
     db_path: &Path,
     policy: SnapshotPolicy,
+    snapshot_id: Option<i64>,
 ) -> Result<LeaderboardState> {
     let db_path = db_path.to_path_buf();
     let span = tracing::info_span!("load_leaderboard_state", db_path = %db_path.display());
     task::spawn_blocking(move || {
         let _entered = span.enter();
         let conn = open_query_connection(&db_path, policy)?;
-        Ok(LeaderboardState {
-            latest_snapshot_id: latest_snapshot_id(&conn)?,
-            leaderboard: latest_leaderboard(&conn)?,
-        })
+        leaderboard_state(&conn, snapshot_id)
     })
     .await
     .context("load_leaderboard_state task join failed")?
@@ -47,6 +33,7 @@ pub async fn load_leaderboard_state(
 
 pub async fn load_recent_events(
     db_path: &Path,
+    snapshot_id: Option<i64>,
     team_filter: Option<&str>,
     limit: usize,
     policy: SnapshotPolicy,
@@ -57,7 +44,7 @@ pub async fn load_recent_events(
     task::spawn_blocking(move || {
         let _entered = span.enter();
         let conn = open_query_connection(&db_path, policy)?;
-        recent_events(&conn, team_filter.as_deref(), limit)
+        events_for_snapshot(&conn, snapshot_id, team_filter.as_deref(), limit)
     })
     .await
     .context("load_recent_events task join failed")?
@@ -66,6 +53,7 @@ pub async fn load_recent_events(
 pub async fn load_chart_series(
     db_path: &Path,
     team_ids: &[String],
+    snapshot_id: Option<i64>,
     policy: SnapshotPolicy,
 ) -> Result<HashMap<String, Vec<ChartPoint>>> {
     let db_path = db_path.to_path_buf();
@@ -78,21 +66,19 @@ pub async fn load_chart_series(
     task::spawn_blocking(move || {
         let _entered = span.enter();
         let conn = open_query_connection(&db_path, policy)?;
-        team_chart_series(&conn, &team_ids)
+        chart_series_to_snapshot(&conn, &team_ids, snapshot_id)
     })
     .await
     .context("load_chart_series task join failed")?
 }
 
-pub async fn load_snapshot_meta(db_path: &Path) -> Result<SnapshotMeta> {
+pub async fn load_snapshot_meta(db_path: &Path, snapshot_id: Option<i64>) -> Result<SnapshotMeta> {
     let db_path = db_path.to_path_buf();
     let span = tracing::info_span!("load_snapshot_meta", db_path = %db_path.display());
     task::spawn_blocking(move || {
         let _entered = span.enter();
         let conn = open_ro(&db_path)?;
-        Ok(SnapshotMeta {
-            latest_snapshot_id: latest_snapshot_id(&conn)?,
-        })
+        snapshot_meta(&conn, snapshot_id)
     })
     .await
     .context("load_snapshot_meta task join failed")?
@@ -134,13 +120,13 @@ mod tests {
         let diff = diff_rows(&HashMap::new(), &rows, Some("2026-05-07"));
         insert_snapshot(&mut conn, Some("2026-05-07"), &rows, &diff).expect("insert snapshot");
 
-        let state = load_leaderboard_state(&db_path, SnapshotPolicy::RequireExisting)
+        let state = load_leaderboard_state(&db_path, SnapshotPolicy::RequireExisting, None)
             .await
             .expect("load state");
-        assert_eq!(state.latest_snapshot_id, Some(1));
+        assert_eq!(state.snapshot.current_snapshot_id, Some(1));
         assert_eq!(state.leaderboard.len(), 1);
 
-        let snapshot = load_snapshot_meta(&db_path).await.expect("snapshot");
+        let snapshot = load_snapshot_meta(&db_path, None).await.expect("snapshot");
         assert_eq!(snapshot.latest_snapshot_id, Some(1));
     }
 }

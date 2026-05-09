@@ -7,24 +7,18 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
-use crate::db::{ChartPoint, EventViewRow, LeaderboardViewRow};
+use crate::db::{ChartPoint, EventViewRow, LeaderboardState, LeaderboardViewRow, SnapshotMeta};
 use crate::query::{
-    SnapshotMeta, SnapshotPolicy, load_chart_series, load_leaderboard_state, load_recent_events,
+    SnapshotPolicy, load_chart_series, load_leaderboard_state, load_recent_events,
     load_snapshot_meta,
 };
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiState {
-    pub snapshot: SnapshotMeta,
-    pub leaderboard: Vec<LeaderboardViewRow>,
-}
 
 #[derive(Debug, Clone)]
 pub struct ApiClient {
@@ -45,12 +39,24 @@ impl ApiClient {
         })
     }
 
-    pub async fn state(&self) -> Result<ApiState> {
-        self.get_json("/api/v1/state").await
+    pub async fn state(&self, snapshot_id: Option<i64>) -> Result<LeaderboardState> {
+        let mut path = String::from("/api/v1/state");
+        if let Some(snapshot_id) = snapshot_id {
+            path.push_str(&format!("?snapshot_id={snapshot_id}"));
+        }
+        self.get_json(&path).await
     }
 
-    pub async fn events(&self, team: Option<&str>, limit: usize) -> Result<Vec<EventViewRow>> {
+    pub async fn events(
+        &self,
+        snapshot_id: Option<i64>,
+        team: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EventViewRow>> {
         let mut path = format!("/api/v1/events?limit={limit}");
+        if let Some(snapshot_id) = snapshot_id {
+            path.push_str(&format!("&snapshot_id={snapshot_id}"));
+        }
         if let Some(team) = team {
             path.push_str("&team=");
             path.push_str(team);
@@ -58,10 +64,23 @@ impl ApiClient {
         self.get_json(&path).await
     }
 
-    pub async fn chart(&self, team_ids: &[String]) -> Result<HashMap<String, Vec<ChartPoint>>> {
+    pub async fn chart(
+        &self,
+        snapshot_id: Option<i64>,
+        team_ids: &[String],
+    ) -> Result<HashMap<String, Vec<ChartPoint>>> {
         let mut path = String::from("/api/v1/chart");
+        let mut has_query = false;
+        if let Some(snapshot_id) = snapshot_id {
+            path.push_str(&format!("?snapshot_id={snapshot_id}"));
+            has_query = true;
+        }
         if !team_ids.is_empty() {
-            path.push_str("?team_ids=");
+            path.push_str(if has_query {
+                "&team_ids="
+            } else {
+                "?team_ids="
+            });
             path.push_str(&team_ids.join(","));
         }
         self.get_json(&path).await
@@ -144,30 +163,33 @@ pub async fn spawn_http_server(db_path: PathBuf, listen: &str) -> Result<ApiServ
 }
 
 #[tracing::instrument(skip(state))]
-async fn get_state(State(state): State<ApiAppState>) -> Result<Json<ApiState>, ApiError> {
+async fn get_state(
+    State(state): State<ApiAppState>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<LeaderboardState>, ApiError> {
     let db_path = state.db_path.clone();
-    let (snapshot, leaderboard_state) = tokio::try_join!(
-        load_snapshot_meta(&db_path),
-        load_leaderboard_state(&db_path, SnapshotPolicy::AllowEmpty),
-    )?;
-    Ok(Json(ApiState {
-        snapshot,
-        leaderboard: leaderboard_state.leaderboard,
-    }))
+    Ok(Json(
+        load_leaderboard_state(&db_path, SnapshotPolicy::AllowEmpty, query.snapshot_id).await?,
+    ))
 }
 
 #[tracing::instrument(skip(state))]
-async fn get_snapshot(State(state): State<ApiAppState>) -> Result<Json<SnapshotMeta>, ApiError> {
+async fn get_snapshot(
+    State(state): State<ApiAppState>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<SnapshotMeta>, ApiError> {
     let db_path = state.db_path.clone();
-    Ok(Json(load_snapshot_meta(&db_path).await?))
+    Ok(Json(load_snapshot_meta(&db_path, query.snapshot_id).await?))
 }
 
 #[tracing::instrument(skip(state))]
 async fn get_leaderboard(
     State(state): State<ApiAppState>,
+    Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<Vec<LeaderboardViewRow>>, ApiError> {
     let db_path = state.db_path.clone();
-    let state = load_leaderboard_state(&db_path, SnapshotPolicy::AllowEmpty).await?;
+    let state =
+        load_leaderboard_state(&db_path, SnapshotPolicy::AllowEmpty, query.snapshot_id).await?;
     Ok(Json(state.leaderboard))
 }
 
@@ -181,6 +203,7 @@ async fn get_events(
     Ok(Json(
         load_recent_events(
             &db_path,
+            query.snapshot_id,
             query.team.as_deref(),
             limit,
             SnapshotPolicy::AllowEmpty,
@@ -206,18 +229,31 @@ async fn get_chart(
         .unwrap_or_default();
     let db_path = state.db_path.clone();
     Ok(Json(
-        load_chart_series(&db_path, &team_ids, SnapshotPolicy::AllowEmpty).await?,
+        load_chart_series(
+            &db_path,
+            &team_ids,
+            query.snapshot_id,
+            SnapshotPolicy::AllowEmpty,
+        )
+        .await?,
     ))
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct SnapshotQuery {
+    snapshot_id: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct EventQuery {
+    snapshot_id: Option<i64>,
     team: Option<String>,
     limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ChartQuery {
+    snapshot_id: Option<i64>,
     team_ids: Option<String>,
 }
 

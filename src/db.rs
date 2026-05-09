@@ -23,6 +23,20 @@ pub struct LeaderboardViewRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SnapshotMeta {
+    pub latest_snapshot_id: Option<i64>,
+    pub current_snapshot_id: Option<i64>,
+    pub previous_snapshot_id: Option<i64>,
+    pub next_snapshot_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LeaderboardState {
+    pub snapshot: SnapshotMeta,
+    pub leaderboard: Vec<LeaderboardViewRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EventViewRow {
     pub fetched_at: String,
     pub team_id: String,
@@ -129,6 +143,75 @@ pub fn latest_snapshot_id(conn: &Connection) -> Result<Option<i64>> {
     )
     .optional()
     .context("failed to query latest snapshot id")
+}
+
+fn snapshot_exists(conn: &Connection, snapshot_id: i64) -> Result<bool> {
+    conn.query_row(
+        "SELECT id FROM snapshots WHERE id = ?1",
+        [snapshot_id],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|value| value.is_some())
+    .context("failed to query snapshot existence")
+}
+
+fn resolve_snapshot_id(
+    conn: &Connection,
+    requested_snapshot_id: Option<i64>,
+) -> Result<Option<i64>> {
+    match requested_snapshot_id {
+        Some(snapshot_id) if snapshot_exists(conn, snapshot_id)? => Ok(Some(snapshot_id)),
+        Some(_) | None => latest_snapshot_id(conn),
+    }
+}
+
+fn previous_snapshot_id(conn: &Connection, snapshot_id: i64) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM snapshots WHERE id < ?1 ORDER BY id DESC LIMIT 1",
+        [snapshot_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .context("failed to query previous snapshot id")
+}
+
+fn next_snapshot_id(conn: &Connection, snapshot_id: i64) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM snapshots WHERE id > ?1 ORDER BY id ASC LIMIT 1",
+        [snapshot_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .context("failed to query next snapshot id")
+}
+
+pub fn snapshot_meta(
+    conn: &Connection,
+    requested_snapshot_id: Option<i64>,
+) -> Result<SnapshotMeta> {
+    let span = tracing::info_span!("snapshot_meta", requested_snapshot_id);
+    let _entered = span.enter();
+    let latest_snapshot_id = latest_snapshot_id(conn)?;
+    let current_snapshot_id = match requested_snapshot_id {
+        Some(snapshot_id) if snapshot_exists(conn, snapshot_id)? => Some(snapshot_id),
+        Some(_) | None => latest_snapshot_id,
+    };
+    let previous_snapshot_id = current_snapshot_id
+        .map(|snapshot_id| previous_snapshot_id(conn, snapshot_id))
+        .transpose()?
+        .flatten();
+    let next_snapshot_id = current_snapshot_id
+        .map(|snapshot_id| next_snapshot_id(conn, snapshot_id))
+        .transpose()?
+        .flatten();
+
+    Ok(SnapshotMeta {
+        latest_snapshot_id,
+        current_snapshot_id,
+        previous_snapshot_id,
+        next_snapshot_id,
+    })
 }
 
 pub fn previous_snapshot_rows(conn: &Connection) -> Result<HashMap<String, PreviousEntry>> {
@@ -281,21 +364,21 @@ ON CONFLICT(external_team_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
     .context("failed to fetch team id")
 }
 
-pub fn latest_leaderboard(conn: &Connection) -> Result<Vec<LeaderboardViewRow>> {
-    let span = tracing::info_span!("latest_leaderboard");
+pub fn leaderboard_state(
+    conn: &Connection,
+    requested_snapshot_id: Option<i64>,
+) -> Result<LeaderboardState> {
+    let span = tracing::info_span!("leaderboard_state", requested_snapshot_id);
     let _entered = span.enter();
-    let Some(snapshot_id) = latest_snapshot_id(conn)? else {
-        return Ok(Vec::new());
+    let snapshot = snapshot_meta(conn, requested_snapshot_id)?;
+    let Some(snapshot_id) = snapshot.current_snapshot_id else {
+        return Ok(LeaderboardState {
+            snapshot,
+            leaderboard: Vec::new(),
+        });
     };
-    let previous_snapshot_id = conn
-        .query_row(
-            "SELECT id FROM snapshots WHERE id < ?1 ORDER BY id DESC LIMIT 1",
-            [snapshot_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
     let mut previous = HashMap::new();
-    if let Some(previous_snapshot_id) = previous_snapshot_id {
+    if let Some(comparison_snapshot_id) = snapshot.previous_snapshot_id {
         let mut statement = conn.prepare(
             r#"
 SELECT t.external_team_id, se.rank, se.score
@@ -304,7 +387,7 @@ JOIN teams t ON t.id = se.team_id
 WHERE se.snapshot_id = ?1 AND se.present = 1
 "#,
         )?;
-        let rows = statement.query_map([previous_snapshot_id], |row| {
+        let rows = statement.query_map([comparison_snapshot_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 (row.get::<_, i64>(1)?, row.get::<_, f64>(2)?),
@@ -351,18 +434,45 @@ ORDER BY se.rank ASC, t.external_team_id ASC
             is_new: previous_values.is_none(),
         });
     }
-    Ok(result)
+    Ok(LeaderboardState {
+        snapshot,
+        leaderboard: result,
+    })
 }
 
 pub fn recent_events(
     conn: &Connection,
+    snapshot_id: Option<i64>,
     team_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<EventViewRow>> {
     let span = tracing::info_span!("recent_events", limit);
     let _entered = span.enter();
-    let query = if team_filter.is_some() {
-        r#"
+    let query = match (snapshot_id, team_filter) {
+        (Some(_), Some(_)) => {
+            r#"
+SELECT s.fetched_at, t.external_team_id, te.event_type, te.old_rank, te.new_rank, te.old_score, te.new_score, te.old_version, te.new_version
+FROM team_events te
+JOIN snapshots s ON s.id = te.snapshot_id
+JOIN teams t ON t.id = te.team_id
+WHERE te.snapshot_id = ?1 AND t.external_team_id = ?2
+ORDER BY te.id DESC
+LIMIT ?3
+"#
+        }
+        (Some(_), None) => {
+            r#"
+SELECT s.fetched_at, t.external_team_id, te.event_type, te.old_rank, te.new_rank, te.old_score, te.new_score, te.old_version, te.new_version
+FROM team_events te
+JOIN snapshots s ON s.id = te.snapshot_id
+JOIN teams t ON t.id = te.team_id
+WHERE te.snapshot_id = ?1
+ORDER BY te.id DESC
+LIMIT ?2
+"#
+        }
+        (None, Some(_)) => {
+            r#"
 SELECT s.fetched_at, t.external_team_id, te.event_type, te.old_rank, te.new_rank, te.old_score, te.new_score, te.old_version, te.new_version
 FROM team_events te
 JOIN snapshots s ON s.id = te.snapshot_id
@@ -371,8 +481,9 @@ WHERE t.external_team_id = ?1
 ORDER BY te.id DESC
 LIMIT ?2
 "#
-    } else {
-        r#"
+        }
+        (None, None) => {
+            r#"
 SELECT s.fetched_at, t.external_team_id, te.event_type, te.old_rank, te.new_rank, te.old_score, te.new_score, te.old_version, te.new_version
 FROM team_events te
 JOIN snapshots s ON s.id = te.snapshot_id
@@ -380,12 +491,20 @@ JOIN teams t ON t.id = te.team_id
 ORDER BY te.id DESC
 LIMIT ?1
 "#
+        }
     };
     let mut statement = conn.prepare(query)?;
-    let rows = if let Some(team_id) = team_filter {
-        statement.query_map(params![team_id, limit as i64], map_event_row)?
-    } else {
-        statement.query_map(params![limit as i64], map_event_row)?
+    let rows = match (snapshot_id, team_filter) {
+        (Some(snapshot_id), Some(team_id)) => {
+            statement.query_map(params![snapshot_id, team_id, limit as i64], map_event_row)?
+        }
+        (Some(snapshot_id), None) => {
+            statement.query_map(params![snapshot_id, limit as i64], map_event_row)?
+        }
+        (None, Some(team_id)) => {
+            statement.query_map(params![team_id, limit as i64], map_event_row)?
+        }
+        (None, None) => statement.query_map(params![limit as i64], map_event_row)?,
     };
     let mut result = Vec::new();
     for row in rows {
@@ -410,15 +529,38 @@ fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventViewRow> {
     })
 }
 
+fn map_chart_point_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChartPoint> {
+    let fetched_at: String = row.get(0)?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(&fetched_at).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(ChartPoint {
+        timestamp: parsed.timestamp(),
+        score: row.get(1)?,
+        rank: row.get(2)?,
+    })
+}
+
 pub fn team_chart_series(
     conn: &Connection,
     team_ids: &[String],
+    snapshot_id: Option<i64>,
 ) -> Result<HashMap<String, Vec<ChartPoint>>> {
     let span = tracing::info_span!("team_chart_series", team_count = team_ids.len());
     let _entered = span.enter();
     let mut result = HashMap::new();
     for team_id in team_ids {
-        let mut statement = conn.prepare(
+        let query = if snapshot_id.is_some() {
+            r#"
+SELECT s.fetched_at, se.score
+     , se.rank
+FROM snapshot_entries se
+JOIN teams t ON t.id = se.team_id
+JOIN snapshots s ON s.id = se.snapshot_id
+WHERE t.external_team_id = ?1 AND se.present = 1 AND se.snapshot_id <= ?2
+ORDER BY s.id ASC
+"#
+        } else {
             r#"
 SELECT s.fetched_at, se.score
      , se.rank
@@ -427,23 +569,14 @@ JOIN teams t ON t.id = se.team_id
 JOIN snapshots s ON s.id = se.snapshot_id
 WHERE t.external_team_id = ?1 AND se.present = 1
 ORDER BY s.id ASC
-"#,
-        )?;
-        let rows = statement.query_map([team_id], |row| {
-            let fetched_at: String = row.get(0)?;
-            let parsed = chrono::DateTime::parse_from_rfc3339(&fetched_at).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-            Ok(ChartPoint {
-                timestamp: parsed.timestamp(),
-                score: row.get(1)?,
-                rank: row.get(2)?,
-            })
-        })?;
+"#
+        };
+        let mut statement = conn.prepare(query)?;
+        let rows = if let Some(snapshot_id) = snapshot_id {
+            statement.query_map(params![team_id, snapshot_id], map_chart_point_row)?
+        } else {
+            statement.query_map([team_id], map_chart_point_row)?
+        };
         let mut series = Vec::new();
         for row in rows {
             series.push(row?);
@@ -451,6 +584,25 @@ ORDER BY s.id ASC
         result.insert(team_id.clone(), series);
     }
     Ok(result)
+}
+
+pub fn chart_series_to_snapshot(
+    conn: &Connection,
+    team_ids: &[String],
+    requested_snapshot_id: Option<i64>,
+) -> Result<HashMap<String, Vec<ChartPoint>>> {
+    let snapshot_id = resolve_snapshot_id(conn, requested_snapshot_id)?;
+    team_chart_series(conn, team_ids, snapshot_id)
+}
+
+pub fn events_for_snapshot(
+    conn: &Connection,
+    requested_snapshot_id: Option<i64>,
+    team_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<EventViewRow>> {
+    let snapshot_id = resolve_snapshot_id(conn, requested_snapshot_id)?;
+    recent_events(conn, snapshot_id, team_filter, limit)
 }
 
 pub fn assert_has_snapshots(conn: &Connection) -> Result<()> {
@@ -597,13 +749,61 @@ mod tests {
         let diff = diff_rows(&HashMap::new(), &rows, Some("2026-05-07"));
         insert_snapshot(&mut conn, Some("2026-05-07"), &rows, &diff).expect("insert snapshot");
 
-        let board = latest_leaderboard(&conn).expect("query board");
+        let board = leaderboard_state(&conn, None)
+            .expect("query board")
+            .leaderboard;
         assert_eq!(board.len(), 1);
         assert_eq!(board[0].team_id, "alpha");
 
-        let events = recent_events(&conn, Some("alpha"), 10).expect("query events");
+        let events = recent_events(&conn, None, Some("alpha"), 10).expect("query events");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, EventType::NewTeam.as_str());
+    }
+
+    #[test]
+    fn loads_specific_snapshot_against_its_previous_snapshot() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("history.sqlite3");
+        let mut conn = open_rw(&db_path).expect("open db");
+
+        let first_rows = vec![LeaderboardRow {
+            rank: 1,
+            team_id: "alpha".to_string(),
+            score: 99.0,
+            version: "v1".to_string(),
+        }];
+        let first_diff = diff_rows(&HashMap::new(), &first_rows, Some("2026-05-07"));
+        insert_snapshot(&mut conn, Some("2026-05-07"), &first_rows, &first_diff)
+            .expect("insert first snapshot");
+
+        let second_rows = vec![LeaderboardRow {
+            rank: 1,
+            team_id: "alpha".to_string(),
+            score: 101.5,
+            version: "v1".to_string(),
+        }];
+        let previous = previous_snapshot_rows(&conn).expect("previous rows");
+        let second_diff = diff_rows(&previous, &second_rows, Some("2026-05-08"));
+        insert_snapshot(&mut conn, Some("2026-05-08"), &second_rows, &second_diff)
+            .expect("insert second snapshot");
+
+        let latest = leaderboard_state(&conn, None).expect("latest state");
+        assert_eq!(latest.snapshot.current_snapshot_id, Some(2));
+        assert_eq!(latest.snapshot.previous_snapshot_id, Some(1));
+        assert_eq!(latest.leaderboard[0].score_delta, Some(2.5));
+
+        let first = leaderboard_state(&conn, Some(1)).expect("first state");
+        assert_eq!(first.snapshot.current_snapshot_id, Some(1));
+        assert_eq!(first.snapshot.previous_snapshot_id, None);
+        assert_eq!(first.leaderboard[0].score_delta, None);
+
+        let events = events_for_snapshot(&conn, Some(2), Some("alpha"), 10).expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, EventType::ScoreChanged.as_str());
+
+        let chart =
+            chart_series_to_snapshot(&conn, &["alpha".to_string()], Some(1)).expect("chart");
+        assert_eq!(chart["alpha"].len(), 1);
     }
 
     #[test]
@@ -623,6 +823,11 @@ mod tests {
 
         assert_eq!(snapshot_count, 6);
         assert!(team_count >= 8);
-        assert!(!latest_leaderboard(&conn).expect("leaderboard").is_empty());
+        assert!(
+            !leaderboard_state(&conn, None)
+                .expect("leaderboard")
+                .leaderboard
+                .is_empty()
+        );
     }
 }

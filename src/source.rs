@@ -7,20 +7,23 @@ use async_trait::async_trait;
 
 use crate::api::ApiClient;
 use crate::config::{Config, TuiSource};
-use crate::db::{ChartPoint, EventViewRow};
-use crate::query::{
-    LeaderboardState, SnapshotPolicy, load_chart_series, load_leaderboard_state, load_recent_events,
-};
+use crate::db::{ChartPoint, EventViewRow, LeaderboardState};
+use crate::query::{SnapshotPolicy, load_chart_series, load_leaderboard_state, load_recent_events};
 
 #[async_trait]
 pub trait TuiDataSource: Send + Sync {
-    async fn load_state(&self) -> Result<LeaderboardState>;
+    async fn load_state(&self, snapshot_id: Option<i64>) -> Result<LeaderboardState>;
     async fn load_events(
         &self,
+        snapshot_id: Option<i64>,
         team_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<EventViewRow>>;
-    async fn load_chart(&self, team_ids: &[String]) -> Result<HashMap<String, Vec<ChartPoint>>>;
+    async fn load_chart(
+        &self,
+        snapshot_id: Option<i64>,
+        team_ids: &[String],
+    ) -> Result<HashMap<String, Vec<ChartPoint>>>;
 }
 
 pub fn build_tui_data_source(config: &Config) -> Result<Arc<dyn TuiDataSource>> {
@@ -40,17 +43,19 @@ struct SqliteTuiDataSource {
 
 #[async_trait]
 impl TuiDataSource for SqliteTuiDataSource {
-    async fn load_state(&self) -> Result<LeaderboardState> {
-        load_leaderboard_state(&self.db_path, SnapshotPolicy::RequireExisting).await
+    async fn load_state(&self, snapshot_id: Option<i64>) -> Result<LeaderboardState> {
+        load_leaderboard_state(&self.db_path, SnapshotPolicy::RequireExisting, snapshot_id).await
     }
 
     async fn load_events(
         &self,
+        snapshot_id: Option<i64>,
         team_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<EventViewRow>> {
         load_recent_events(
             &self.db_path,
+            snapshot_id,
             team_filter,
             limit,
             SnapshotPolicy::RequireExisting,
@@ -58,8 +63,18 @@ impl TuiDataSource for SqliteTuiDataSource {
         .await
     }
 
-    async fn load_chart(&self, team_ids: &[String]) -> Result<HashMap<String, Vec<ChartPoint>>> {
-        load_chart_series(&self.db_path, team_ids, SnapshotPolicy::RequireExisting).await
+    async fn load_chart(
+        &self,
+        snapshot_id: Option<i64>,
+        team_ids: &[String],
+    ) -> Result<HashMap<String, Vec<ChartPoint>>> {
+        load_chart_series(
+            &self.db_path,
+            team_ids,
+            snapshot_id,
+            SnapshotPolicy::RequireExisting,
+        )
+        .await
     }
 }
 
@@ -69,23 +84,24 @@ struct HttpTuiDataSource {
 
 #[async_trait]
 impl TuiDataSource for HttpTuiDataSource {
-    async fn load_state(&self) -> Result<LeaderboardState> {
-        let state = self.api.state().await?;
-        Ok(LeaderboardState {
-            latest_snapshot_id: state.snapshot.latest_snapshot_id,
-            leaderboard: state.leaderboard,
-        })
+    async fn load_state(&self, snapshot_id: Option<i64>) -> Result<LeaderboardState> {
+        self.api.state(snapshot_id).await
     }
 
     async fn load_events(
         &self,
+        snapshot_id: Option<i64>,
         team_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<EventViewRow>> {
-        self.api.events(team_filter, limit).await
+        self.api.events(snapshot_id, team_filter, limit).await
     }
 
-    async fn load_chart(&self, team_ids: &[String]) -> Result<HashMap<String, Vec<ChartPoint>>> {
-        self.api.chart(team_ids).await
+    async fn load_chart(
+        &self,
+        snapshot_id: Option<i64>,
+        team_ids: &[String],
+    ) -> Result<HashMap<String, Vec<ChartPoint>>> {
+        self.api.chart(snapshot_id, team_ids).await
     }
 }

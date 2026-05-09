@@ -84,6 +84,10 @@ enum ChartMode {
 struct App {
     data_source: Arc<dyn TuiDataSource>,
     latest_snapshot_id: Option<i64>,
+    current_snapshot_id: Option<i64>,
+    previous_snapshot_id: Option<i64>,
+    next_snapshot_id: Option<i64>,
+    follow_latest: bool,
     leaderboard: Vec<LeaderboardViewRow>,
     filtered_indices: Vec<usize>,
     events: Vec<EventViewRow>,
@@ -109,10 +113,10 @@ struct App {
     last_refresh: Instant,
     status: String,
     last_click: Option<ClickInfo>,
-    event_cache: HashMap<Option<String>, Vec<EventViewRow>>,
-    event_cache_order: VecDeque<Option<String>>,
-    chart_cache: HashMap<String, Vec<ChartPoint>>,
-    chart_cache_order: VecDeque<String>,
+    event_cache: HashMap<(Option<i64>, Option<String>), Vec<EventViewRow>>,
+    event_cache_order: VecDeque<(Option<i64>, Option<String>)>,
+    chart_cache: HashMap<(Option<i64>, String), Vec<ChartPoint>>,
+    chart_cache_order: VecDeque<(Option<i64>, String)>,
     event_loader: LoaderState<EventLoadRequest, EventLoadResponse>,
     chart_loader: LoaderState<ChartLoadRequest, ChartLoadResponse>,
 }
@@ -161,12 +165,14 @@ impl<Request, Response> LoaderState<Request, Response> {
 #[derive(Debug)]
 struct EventLoadRequest {
     request_id: u64,
+    snapshot_id: Option<i64>,
     team_filter: Option<String>,
 }
 
 #[derive(Debug)]
 struct EventLoadResponse {
     request_id: u64,
+    snapshot_id: Option<i64>,
     team_filter: Option<String>,
     result: std::result::Result<Vec<EventViewRow>, String>,
 }
@@ -174,6 +180,7 @@ struct EventLoadResponse {
 #[derive(Debug)]
 struct ChartLoadRequest {
     request_id: u64,
+    snapshot_id: Option<i64>,
     display_team_ids: Vec<String>,
     fetch_team_ids: Vec<String>,
 }
@@ -181,6 +188,7 @@ struct ChartLoadRequest {
 #[derive(Debug)]
 struct ChartLoadResponse {
     request_id: u64,
+    snapshot_id: Option<i64>,
     display_team_ids: Vec<String>,
     result: std::result::Result<HashMap<String, Vec<ChartPoint>>, String>,
 }
@@ -192,6 +200,10 @@ impl App {
         let mut app = Self {
             data_source,
             latest_snapshot_id: None,
+            current_snapshot_id: None,
+            previous_snapshot_id: None,
+            next_snapshot_id: None,
+            follow_latest: true,
             leaderboard: Vec::new(),
             filtered_indices: Vec::new(),
             events: Vec::new(),
@@ -229,21 +241,39 @@ impl App {
     }
 
     async fn reload(&mut self, force: bool) -> Result<()> {
-        let state = self.data_source.load_state().await?;
-        let current_snapshot_id = state.latest_snapshot_id;
-        if !force && current_snapshot_id == self.latest_snapshot_id {
+        let requested_snapshot_id = if self.follow_latest {
+            None
+        } else {
+            self.current_snapshot_id
+        };
+        let state = self.data_source.load_state(requested_snapshot_id).await?;
+        let snapshot = state.snapshot;
+        let current_snapshot_id = snapshot.current_snapshot_id;
+        let selection_changed = current_snapshot_id != self.current_snapshot_id;
+        let latest_changed = snapshot.latest_snapshot_id != self.latest_snapshot_id;
+        if !force && !selection_changed && !latest_changed {
             self.last_refresh = Instant::now();
             return Ok(());
         }
-        self.latest_snapshot_id = current_snapshot_id;
+        self.latest_snapshot_id = snapshot.latest_snapshot_id;
+        self.current_snapshot_id = snapshot.current_snapshot_id;
+        self.previous_snapshot_id = snapshot.previous_snapshot_id;
+        self.next_snapshot_id = snapshot.next_snapshot_id;
         self.leaderboard = state.leaderboard;
         self.clear_dependent_caches();
         self.apply_filter();
         self.schedule_dependent_loads(true).await?;
         self.last_refresh = Instant::now();
         self.status = format!(
-            "snapshot={} teams={} compare={}",
-            self.latest_snapshot_id.unwrap_or_default(),
+            "snapshot={} prev={} next={} mode={} teams={} compare={}",
+            self.current_snapshot_id.unwrap_or_default(),
+            self.previous_snapshot_id.unwrap_or_default(),
+            self.next_snapshot_id.unwrap_or_default(),
+            if self.follow_latest {
+                "latest"
+            } else {
+                "history"
+            },
             self.leaderboard.len(),
             self.compare_teams.len()
         );
@@ -286,6 +316,7 @@ impl App {
             return Ok(());
         }
         let request_id = self.event_loader.issue_request_id();
+        let snapshot_id = self.current_snapshot_id;
         self.events_loading = true;
         self.events_scope = selected_team.clone();
         self.event_scroll = 0;
@@ -293,6 +324,7 @@ impl App {
             .tx
             .send(LoaderCommand::Load(EventLoadRequest {
                 request_id,
+                snapshot_id,
                 team_filter: selected_team,
             }))
             .map_err(|_| anyhow!("event loader thread stopped unexpectedly"))?;
@@ -311,12 +343,14 @@ impl App {
             return Ok(());
         }
         let request_id = self.chart_loader.issue_request_id();
+        let snapshot_id = self.current_snapshot_id;
         let fetch_team_ids = self.prefetch_chart_team_ids(&display_team_ids);
         self.chart_loading = true;
         self.chart_loader
             .tx
             .send(LoaderCommand::Load(ChartLoadRequest {
                 request_id,
+                snapshot_id,
                 display_team_ids,
                 fetch_team_ids,
             }))
@@ -341,6 +375,9 @@ impl App {
         if response.request_id != self.event_loader.latest_request_id {
             return;
         }
+        if response.snapshot_id != self.current_snapshot_id {
+            return;
+        }
         self.events_loading = false;
         match response.result {
             Ok(events) => {
@@ -361,6 +398,9 @@ impl App {
             return;
         };
         if response.request_id != self.chart_loader.latest_request_id {
+            return;
+        }
+        if response.snapshot_id != self.current_snapshot_id {
             return;
         }
         self.chart_loading = false;
@@ -419,19 +459,20 @@ impl App {
     }
 
     fn apply_cached_events(&mut self, team_filter: &Option<String>) -> bool {
-        let Some(events) = self.event_cache.get(team_filter).cloned() else {
+        let key = (self.current_snapshot_id, team_filter.clone());
+        let Some(events) = self.event_cache.get(&key).cloned() else {
             return false;
         };
         self.events = events;
         self.events_scope = team_filter.clone();
         self.events_loading = false;
         self.event_scroll = 0;
-        self.touch_event_cache_key(team_filter);
+        self.touch_event_cache_key(&key);
         true
     }
 
     fn store_event_cache(&mut self, team_filter: Option<String>, events: Vec<EventViewRow>) {
-        let key = team_filter;
+        let key = (self.current_snapshot_id, team_filter);
         self.event_cache.insert(key.clone(), events);
         self.touch_event_cache_key(&key);
         while self.event_cache.len() > EVENT_CACHE_LIMIT {
@@ -441,7 +482,7 @@ impl App {
         }
     }
 
-    fn touch_event_cache_key(&mut self, key: &Option<String>) {
+    fn touch_event_cache_key(&mut self, key: &(Option<i64>, Option<String>)) {
         if let Some(index) = self.event_cache_order.iter().position(|item| item == key) {
             self.event_cache_order.remove(index);
         }
@@ -449,10 +490,11 @@ impl App {
     }
 
     fn apply_cached_chart(&mut self, display_team_ids: &[String]) -> bool {
-        if display_team_ids
-            .iter()
-            .any(|team_id| !self.chart_cache.contains_key(team_id))
-        {
+        if display_team_ids.iter().any(|team_id| {
+            !self
+                .chart_cache
+                .contains_key(&(self.current_snapshot_id, team_id.clone()))
+        }) {
             return false;
         }
         self.chart_series = display_team_ids
@@ -460,22 +502,26 @@ impl App {
             .map(|team_id| {
                 (
                     team_id.clone(),
-                    self.chart_cache.get(team_id).cloned().unwrap_or_default(),
+                    self.chart_cache
+                        .get(&(self.current_snapshot_id, team_id.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
                 )
             })
             .collect();
         self.chart_scope = display_team_ids.to_vec();
         self.chart_loading = false;
         for team_id in display_team_ids {
-            self.touch_chart_cache_key(team_id);
+            self.touch_chart_cache_key(&(self.current_snapshot_id, team_id.clone()));
         }
         true
     }
 
     fn store_chart_cache(&mut self, series: HashMap<String, Vec<ChartPoint>>) {
         for (team_id, points) in series {
-            self.chart_cache.insert(team_id.clone(), points);
-            self.touch_chart_cache_key(&team_id);
+            let key = (self.current_snapshot_id, team_id);
+            self.chart_cache.insert(key.clone(), points);
+            self.touch_chart_cache_key(&key);
         }
         while self.chart_cache.len() > CHART_CACHE_LIMIT {
             if let Some(oldest) = self.chart_cache_order.pop_front() {
@@ -484,11 +530,11 @@ impl App {
         }
     }
 
-    fn touch_chart_cache_key(&mut self, key: &str) {
+    fn touch_chart_cache_key(&mut self, key: &(Option<i64>, String)) {
         if let Some(index) = self.chart_cache_order.iter().position(|item| item == key) {
             self.chart_cache_order.remove(index);
         }
-        self.chart_cache_order.push_back(key.to_string());
+        self.chart_cache_order.push_back(key.clone());
     }
 
     fn prefetch_chart_team_ids(&self, display_team_ids: &[String]) -> Vec<String> {
@@ -671,6 +717,34 @@ impl App {
         Ok(())
     }
 
+    async fn step_snapshot(&mut self, direction: isize) -> Result<()> {
+        let target_snapshot_id = match direction {
+            value if value < 0 => self.previous_snapshot_id,
+            value if value > 0 => {
+                if self.follow_latest {
+                    self.next_snapshot_id.or(self.latest_snapshot_id)
+                } else {
+                    self.next_snapshot_id
+                }
+            }
+            _ => self.current_snapshot_id,
+        };
+
+        let Some(target_snapshot_id) = target_snapshot_id else {
+            return Ok(());
+        };
+
+        self.follow_latest = self.latest_snapshot_id == Some(target_snapshot_id) && direction > 0;
+        self.current_snapshot_id = Some(target_snapshot_id);
+        self.reload(true).await
+    }
+
+    async fn jump_to_latest_snapshot(&mut self) -> Result<()> {
+        self.follow_latest = true;
+        self.current_snapshot_id = self.latest_snapshot_id;
+        self.reload(true).await
+    }
+
     fn toggle_chart_fullscreen(&mut self) {
         self.chart_fullscreen = !self.chart_fullscreen;
         if self.chart_fullscreen {
@@ -807,12 +881,17 @@ fn spawn_event_loader(
                         }
                     }
                     let result = data_source
-                        .load_events(request.team_filter.as_deref(), RECENT_EVENTS_LIMIT)
+                        .load_events(
+                            request.snapshot_id,
+                            request.team_filter.as_deref(),
+                            RECENT_EVENTS_LIMIT,
+                        )
                         .await
                         .map_err(|error| error.to_string());
                     if tx_results
                         .send(EventLoadResponse {
                             request_id: request.request_id,
+                            snapshot_id: request.snapshot_id,
                             team_filter: request.team_filter,
                             result,
                         })
@@ -850,12 +929,13 @@ fn spawn_chart_loader(
                         }
                     }
                     let result = data_source
-                        .load_chart(&request.fetch_team_ids)
+                        .load_chart(request.snapshot_id, &request.fetch_team_ids)
                         .await
                         .map_err(|error| error.to_string());
                     if tx_results
                         .send(ChartLoadResponse {
                             request_id: request.request_id,
+                            snapshot_id: request.snapshot_id,
                             display_team_ids: request.display_team_ids,
                             result,
                         })
@@ -946,6 +1026,9 @@ async fn run_app(
                             KeyCode::Char('G') => app.jump_to_bottom().await?,
                             KeyCode::Char('[') => app.page_by(-1).await?,
                             KeyCode::Char(']') => app.page_by(1).await?,
+                            KeyCode::Char('n') => app.step_snapshot(-1).await?,
+                            KeyCode::Char('m') => app.step_snapshot(1).await?,
+                            KeyCode::Char('M') => app.jump_to_latest_snapshot().await?,
                             KeyCode::Char('o') => app.toggle_chart_fullscreen(),
                             KeyCode::Char('O') => app.toggle_event_fullscreen(),
                             KeyCode::Char('t') => app.toggle_chart_mode(),
@@ -1073,10 +1156,19 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
         })
         .collect();
 
-    let title = if app.search_mode {
-        format!("Leaderboard /{}", app.search_input)
+    let snapshot_label = if app.follow_latest {
+        format!("snapshot {}", app.current_snapshot_id.unwrap_or_default())
     } else {
-        "Leaderboard".to_string()
+        format!(
+            "snapshot {} of latest {}",
+            app.current_snapshot_id.unwrap_or_default(),
+            app.latest_snapshot_id.unwrap_or_default()
+        )
+    };
+    let title = if app.search_mode {
+        format!("Leaderboard {} /{}", snapshot_label, app.search_input)
+    } else {
+        format!("Leaderboard {}", snapshot_label)
     };
     let table = Table::new(
         rows,
@@ -1313,11 +1405,22 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else if app.show_help {
         "h/?/Esc close help  q quit"
     } else {
-        "q quit  / search  h/? help  o chart  O events  t metric  [ ] page  g/G jump"
+        "q quit  / search  h/? help  n/m snapshot  M latest  o chart  O events  t metric  [ ] page  g/G jump"
     };
+    let snapshot = format!(
+        "snapshot={}/{}/{} mode={}",
+        app.previous_snapshot_id.unwrap_or_default(),
+        app.current_snapshot_id.unwrap_or_default(),
+        app.next_snapshot_id.unwrap_or_default(),
+        if app.follow_latest {
+            "latest"
+        } else {
+            "history"
+        }
+    );
     let help = format!(
-        "{} | selected={} focus={:?} | {} | {}",
-        hints, selected, app.focus, loading, app.status
+        "{} | {} | selected={} focus={:?} | {} | {}",
+        hints, snapshot, selected, app.focus, loading, app.status
     );
     let paragraph =
         Paragraph::new(help).block(Block::default().borders(Borders::ALL).title("Status"));
@@ -1340,6 +1443,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, chart_fullscreen: bool) {
         Line::from(""),
         Line::from("Views"),
         Line::from("Space: add/remove selected team from chart compare"),
+        Line::from("n / m: previous / next snapshot"),
+        Line::from("M: jump back to latest snapshot"),
         Line::from("o: toggle chart fullscreen"),
         Line::from("O: toggle events fullscreen"),
         Line::from("t: toggle score / rank chart"),
